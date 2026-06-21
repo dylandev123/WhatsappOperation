@@ -1,0 +1,12 @@
+services:
+  devaux-whatsapp:
+    build: .
+    container_name: devaux-whatsapp
+    restart: unless-stopped
+    ports:
+      - "3030:3030"
+    env_file:
+      - .env
+    volumes:
+      - ./auth:/app/auth
+      - ./media:/app/media
