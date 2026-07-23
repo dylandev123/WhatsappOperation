@@ -20,6 +20,9 @@ type Session = {
   qr?: string;
   qrDataUrl?: string;
   status: "starting" | "qr" | "connected" | "disconnected";
+  // IDs of messages sendTextMessage() already saved directly, so the
+  // messages.upsert echo of that same send (fromMe: true) isn't saved twice.
+  sentMessageIds: Set<string>;
 };
 
 const logger = P({ level: "info" });
@@ -73,7 +76,15 @@ async function saveMediaIfAny(businessSlug: string, message: proto.IWebMessageIn
       message,
       "buffer",
       {},
-      { logger, reuploadRequest: sessions.get(businessSlug)?.socket?.updateMediaMessage }
+      {
+        logger,
+        // Baileys types this as required even though it's only needed when a
+        // media message has expired and must be re-fetched; the session's
+        // socket is always set by the time this handler can fire.
+        reuploadRequest: sessions.get(businessSlug)?.socket?.updateMediaMessage as NonNullable<
+          Parameters<typeof downloadMediaMessage>[3]
+        >["reuploadRequest"]
+      }
     );
 
     const extension =
@@ -98,7 +109,8 @@ export async function startSession(businessSlug: string) {
 
   const session: Session = sessions.get(businessSlug) || {
     businessSlug,
-    status: "starting"
+    status: "starting",
+    sentMessageIds: new Set()
   };
 
   session.status = "starting";
@@ -171,30 +183,39 @@ export async function startSession(businessSlug: string) {
 
     for (const msg of messages) {
       if (!msg.message) continue;
-      if (msg.key.fromMe) continue;
+
+      // sendTextMessage() already saved this exact message when the app sent
+      // it; this event is just Baileys echoing it back. Messages sent from
+      // the phone directly (not through the app) are fromMe too, but have no
+      // entry here, so they still fall through and get saved below.
+      if (msg.key.fromMe && msg.key.id && session.sentMessageIds.has(msg.key.id)) {
+        session.sentMessageIds.delete(msg.key.id);
+        continue;
+      }
 
       const chatId = msg.key.remoteJid || "";
       const messageBody = getTextMessage(msg.message);
       const messageType = getMessageType(msg.message);
       const mediaUrl = await saveMediaIfAny(businessSlug, msg);
+      const direction = msg.key.fromMe ? "outbound" : "inbound";
 
       await saveMessage({
         business_slug: businessSlug,
         whatsapp_message_id: msg.key.id,
         chat_id: chatId,
         contact_number: contactFromChatId(chatId),
-        contact_name: msg.pushName || null,
+        contact_name: msg.key.fromMe ? null : msg.pushName || null,
         message_body: messageBody,
         message_type: messageType,
         media_url: mediaUrl,
-        direction: "inbound",
+        direction,
         timestamp: msg.messageTimestamp
           ? new Date(Number(msg.messageTimestamp) * 1000).toISOString()
           : new Date().toISOString(),
         raw: msg
       });
 
-      console.log(`[${businessSlug}] inbound from ${chatId}: ${messageBody}`);
+      console.log(`[${businessSlug}] ${direction} ${msg.key.fromMe ? "from phone " : ""}${chatId}: ${messageBody}`);
     }
   });
 
@@ -227,6 +248,8 @@ export async function sendTextMessage(businessSlug: string, to: string, body: st
 
   const chatId = to.includes("@") ? to : `${to.replace(/\D/g, "")}@s.whatsapp.net`;
   const result = await session.socket.sendMessage(chatId, { text: body });
+
+  if (result?.key?.id) session.sentMessageIds.add(result.key.id);
 
   await saveMessage({
     business_slug: businessSlug,
