@@ -88,6 +88,19 @@ app.get("/api/status", requireAdmin, (_req, res) => {
   res.json({ sessions: getSessionStatus() });
 });
 
+// The app's lib/server/whatsappBridge.ts calls this path (its default
+// QR_PATH_TEMPLATE) expecting JSON — distinct from the /admin/qr/:businessSlug
+// HTML page above, which existed but was never the route the app called.
+app.get("/api/session/:slug/qr", requireAdmin, (req, res) => {
+  const qr = getQrDataUrl(req.params.slug);
+  if (!qr) {
+    return res.status(404).json({
+      error: "No QR available. The session may already be connected or still starting."
+    });
+  }
+  res.json({ qr });
+});
+
 app.post("/api/send", requireAdmin, async (req, res) => {
   try {
     const { businessSlug, to, body } = req.body;
