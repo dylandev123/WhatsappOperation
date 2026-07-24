@@ -75,6 +75,32 @@ app.post("/admin/restart/:businessSlug", auth_js_1.requireAdmin, async (req, res
 app.get("/api/status", auth_js_1.requireAdmin, (_req, res) => {
     res.json({ sessions: (0, whatsapp_js_1.getSessionStatus)() });
 });
+// The app's lib/server/whatsappBridge.ts calls this path (its default
+// QR_PATH_TEMPLATE) expecting JSON — distinct from the /admin/qr/:businessSlug
+// HTML page above, which existed but was never the route the app called.
+app.get("/api/session/:slug/qr", auth_js_1.requireAdmin, (req, res) => {
+    const qr = (0, whatsapp_js_1.getQrDataUrl)(req.params.slug);
+    if (!qr) {
+        return res.status(404).json({
+            error: "No QR available. The session may already be connected or still starting."
+        });
+    }
+    res.json({ qr });
+});
+// Same gap as the QR route above: the app calls this JSON path (its default
+// RESTART_PATH_TEMPLATE), which never existed — only the HTML
+// /admin/restart/:businessSlug route above did. Resolves the slug the same
+// case-insensitive way as the QR route, then reuses restartSession() as-is
+// (unchanged) on the session's actual stored key, so a differently-cased
+// request can't spin up a second session under a new key.
+app.post("/api/session/:slug/restart", auth_js_1.requireAdmin, async (req, res) => {
+    const session = (0, whatsapp_js_1.findSession)(req.params.slug);
+    if (!session) {
+        return res.status(404).json({ error: "Unknown session" });
+    }
+    await (0, whatsapp_js_1.restartSession)(session.businessSlug);
+    res.json({ ok: true });
+});
 app.post("/api/send", auth_js_1.requireAdmin, async (req, res) => {
     try {
         const { businessSlug, to, body } = req.body;

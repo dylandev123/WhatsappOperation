@@ -4,6 +4,7 @@ import path from "path";
 import { config } from "./config.js";
 import { requireAdmin } from "./auth.js";
 import {
+  findSession,
   getQrDataUrl,
   getSessionStatus,
   restartSession,
@@ -99,6 +100,21 @@ app.get("/api/session/:slug/qr", requireAdmin, (req, res) => {
     });
   }
   res.json({ qr });
+});
+
+// Same gap as the QR route above: the app calls this JSON path (its default
+// RESTART_PATH_TEMPLATE), which never existed — only the HTML
+// /admin/restart/:businessSlug route above did. Resolves the slug the same
+// case-insensitive way as the QR route, then reuses restartSession() as-is
+// (unchanged) on the session's actual stored key, so a differently-cased
+// request can't spin up a second session under a new key.
+app.post("/api/session/:slug/restart", requireAdmin, async (req, res) => {
+  const session = findSession(req.params.slug);
+  if (!session) {
+    return res.status(404).json({ error: "Unknown session" });
+  }
+  await restartSession(session.businessSlug);
+  res.json({ ok: true });
 });
 
 app.post("/api/send", requireAdmin, async (req, res) => {

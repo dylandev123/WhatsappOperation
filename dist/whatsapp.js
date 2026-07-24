@@ -39,6 +39,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.startSession = startSession;
 exports.startAllSessions = startAllSessions;
 exports.getSessionStatus = getSessionStatus;
+exports.findSession = findSession;
 exports.getQrDataUrl = getQrDataUrl;
 exports.sendTextMessage = sendTextMessage;
 exports.restartSession = restartSession;
@@ -226,8 +227,25 @@ function getSessionStatus() {
         hasQr: Boolean(session.qrDataUrl)
     }));
 }
+// Session keys are whatever string config.businesses (the BUSINESSES env
+// var) or an admin action first started a session with — case is preserved
+// as-is, not normalized. QR lookups can arrive with a differently-cased
+// slug (e.g. the app's canonical "by_sea" vs. a legacy "By_Sea" session), so
+// fall back to a case-insensitive scan rather than renaming/duplicating the
+// live session.
+function findSession(businessSlug) {
+    const exact = sessions.get(businessSlug);
+    if (exact)
+        return exact;
+    const lower = businessSlug.toLowerCase();
+    for (const [key, session] of sessions) {
+        if (key.toLowerCase() === lower)
+            return session;
+    }
+    return undefined;
+}
 function getQrDataUrl(businessSlug) {
-    return sessions.get(businessSlug)?.qrDataUrl || null;
+    return findSession(businessSlug)?.qrDataUrl || null;
 }
 async function sendTextMessage(businessSlug, to, body) {
     const session = sessions.get(businessSlug);

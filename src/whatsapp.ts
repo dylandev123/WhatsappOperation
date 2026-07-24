@@ -242,7 +242,7 @@ export function getSessionStatus() {
 // slug (e.g. the app's canonical "by_sea" vs. a legacy "By_Sea" session), so
 // fall back to a case-insensitive scan rather than renaming/duplicating the
 // live session.
-function findSession(businessSlug: string): Session | undefined {
+export function findSession(businessSlug: string): Session | undefined {
   const exact = sessions.get(businessSlug);
   if (exact) return exact;
   const lower = businessSlug.toLowerCase();
