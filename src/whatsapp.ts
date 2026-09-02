@@ -128,12 +128,28 @@ async function saveMediaIfAny(businessSlug: string, message: proto.IWebMessageIn
 }
 
 function updateContactNames(session: Session, contacts: Array<Partial<Contact>> | undefined) {
-  if (!contacts) return;
+  if (!contacts?.length) return;
+
+  let namedCount = 0;
   for (const contact of contacts) {
     if (!contact.name) continue;
+    namedCount++;
+    // Root cause of business_contact_name never populating: many chats on
+    // this account are keyed by the WhatsApp @lid privacy id rather than the
+    // phone-based jid (see resolveInboundContactNumber above), but the saved
+    // name only ever arrived indexed by contact.id/contact.jid (the
+    // phone-based jid) — contact.lid was never stored, so a message whose
+    // chat_id is the @lid form could never match. Index all three forms.
     if (contact.id) session.contactNames.set(contact.id, contact.name);
     if (contact.jid) session.contactNames.set(contact.jid, contact.name);
+    if (contact.lid) session.contactNames.set(contact.lid, contact.name);
   }
+
+  // TEMPORARY diagnostic log — remove once business_contact_name is
+  // confirmed flowing to Supabase. Counts only, no contact/message content.
+  console.log(
+    `[${session.businessSlug}] contact event: received=${contacts.length} withSavedName=${namedCount} mapSize=${session.contactNames.size}`
+  );
 }
 
 function getBusinessContactName(session: Session, jid: string): string | null {
@@ -158,6 +174,13 @@ async function buildMessageRow(
   const contactNumber = msg.key.fromMe
     ? contactFromChatId(chatId)
     : resolveInboundContactNumber(msg.key, chatId);
+  const businessContactName = getBusinessContactName(session, chatId);
+
+  // TEMPORARY diagnostic log — remove once business_contact_name is
+  // confirmed flowing to Supabase. chat_id/resolved name only, no body text.
+  console.log(
+    `[${businessSlug}] business_contact_name lookup chat_id=${chatId} resolved=${businessContactName ?? "none"}`
+  );
 
   return {
     business_slug: businessSlug,
@@ -165,7 +188,7 @@ async function buildMessageRow(
     chat_id: chatId,
     contact_number: contactNumber,
     contact_name: msg.key.fromMe ? null : msg.pushName || null,
-    business_contact_name: getBusinessContactName(session, chatId),
+    business_contact_name: businessContactName,
     message_body: messageBody,
     message_type: messageType,
     media_url: mediaUrl,
