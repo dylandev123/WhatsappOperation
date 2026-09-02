@@ -4,7 +4,9 @@ import makeWASocket, {
   makeCacheableSignalKeyStore,
   useMultiFileAuthState,
   proto,
-  downloadMediaMessage
+  downloadMediaMessage,
+  WAMessageKey,
+  Contact
 } from "@whiskeysockets/baileys";
 import P from "pino";
 import QRCode from "qrcode";
@@ -23,10 +25,18 @@ type Session = {
   // IDs of messages sendTextMessage() already saved directly, so the
   // messages.upsert echo of that same send (fromMe: true) isn't saved twice.
   sentMessageIds: Set<string>;
+  // JID -> device/saved contact name (Baileys Contact.name), from
+  // contacts.upsert/contacts.update and the messaging-history.set backfill.
+  // Keyed by both contact.id and contact.jid since either may match a
+  // message's remoteJid depending on whether it's a @lid or phone-based jid.
+  contactNames: Map<string, string>;
 };
 
 const logger = P({ level: "info" });
 const sessions = new Map<string, Session>();
+
+// Only import messages from the last 2 days on link/relink history sync.
+const HISTORY_IMPORT_WINDOW_SECONDS = 2 * 24 * 60 * 60;
 
 function ensureDir(dir: string) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -57,6 +67,19 @@ function getMessageType(message?: proto.IMessage | null): string {
 
 function contactFromChatId(chatId: string): string {
   return chatId.replace("@s.whatsapp.net", "").replace("@g.us", "");
+}
+
+function digitsOnly(value: string): string {
+  return value.replace(/[^0-9]/g, "");
+}
+
+// remoteJid can be a WhatsApp @lid privacy id (not a real, dialable number)
+// instead of the contact's actual phone number. senderPn/participantPn carry
+// the real number when Baileys has it, so prefer those for inbound messages;
+// fall back to remoteJid only when neither is present. Digits-only strips
+// @s.whatsapp.net/@lid (and anything else non-numeric) in one step.
+function resolveInboundContactNumber(key: WAMessageKey, chatId: string): string {
+  return digitsOnly(key.senderPn || key.participantPn || chatId);
 }
 
 async function saveMediaIfAny(businessSlug: string, message: proto.IWebMessageInfo) {
@@ -104,13 +127,110 @@ async function saveMediaIfAny(businessSlug: string, message: proto.IWebMessageIn
   }
 }
 
+function updateContactNames(session: Session, contacts: Array<Partial<Contact>> | undefined) {
+  if (!contacts) return;
+  for (const contact of contacts) {
+    if (!contact.name) continue;
+    if (contact.id) session.contactNames.set(contact.id, contact.name);
+    if (contact.jid) session.contactNames.set(contact.jid, contact.name);
+  }
+}
+
+function getBusinessContactName(session: Session, jid: string): string | null {
+  return session.contactNames.get(jid) ?? null;
+}
+
+// Shared row shape for both the live messages.upsert handler and history
+// import, so a historical row's chat_id/contact fields always match what a
+// live message for the same chat would get (same thread, not a split one).
+async function buildMessageRow(
+  businessSlug: string,
+  session: Session,
+  msg: proto.IWebMessageInfo
+): Promise<Record<string, unknown> | null> {
+  if (!msg.message) return null;
+
+  const chatId = msg.key.remoteJid || "";
+  const messageBody = getTextMessage(msg.message);
+  const messageType = getMessageType(msg.message);
+  const mediaUrl = await saveMediaIfAny(businessSlug, msg);
+  const direction = msg.key.fromMe ? "outbound" : "inbound";
+  const contactNumber = msg.key.fromMe
+    ? contactFromChatId(chatId)
+    : resolveInboundContactNumber(msg.key, chatId);
+
+  return {
+    business_slug: businessSlug,
+    whatsapp_message_id: msg.key.id,
+    chat_id: chatId,
+    contact_number: contactNumber,
+    contact_name: msg.key.fromMe ? null : msg.pushName || null,
+    business_contact_name: getBusinessContactName(session, chatId),
+    message_body: messageBody,
+    message_type: messageType,
+    media_url: mediaUrl,
+    direction,
+    timestamp: msg.messageTimestamp
+      ? new Date(Number(msg.messageTimestamp) * 1000).toISOString()
+      : new Date().toISOString(),
+    raw: msg
+  };
+}
+
+// Mirrors isSystemChatId()-style filtering plus the noise Baileys' history
+// sync includes that a live messages.upsert never sends (protocol/app-state
+// messages, history-sync notifications, WA-generated stub events).
+function shouldSkipHistoryMessage(msg: proto.IWebMessageInfo, cutoffSeconds: number): boolean {
+  const timestamp = Number(msg.messageTimestamp || 0);
+  if (timestamp < cutoffSeconds) return true;
+
+  const remoteJid = msg.key.remoteJid || "";
+  if (remoteJid === "status@broadcast" || remoteJid.endsWith("@broadcast")) return true;
+
+  if (msg.messageStubType) return true;
+
+  const message = msg.message;
+  if (!message) return true;
+  // protocolMessage carries key distribution / app-state sync / history-sync
+  // notifications with no user-visible content unless a real text payload
+  // rides alongside it.
+  if (message.protocolMessage && !message.conversation && !message.extendedTextMessage) return true;
+
+  return false;
+}
+
+async function importHistory(businessSlug: string, session: Session, messages: proto.IWebMessageInfo[]) {
+  const cutoffSeconds = Math.floor(Date.now() / 1000) - HISTORY_IMPORT_WINDOW_SECONDS;
+  const candidates = messages.filter((msg) => !shouldSkipHistoryMessage(msg, cutoffSeconds));
+
+  if (!candidates.length) return;
+
+  // Bounded concurrency, not a single multi-row insert: saveMessage() relies
+  // on the whatsapp_messages_dedupe_idx unique-violation error to skip
+  // duplicates (see supabase.ts), which only works one row at a time — a
+  // multi-row insert would fail (and drop) the whole batch on one conflict.
+  const CONCURRENCY = 20;
+  let imported = 0;
+  for (let i = 0; i < candidates.length; i += CONCURRENCY) {
+    const chunk = candidates.slice(i, i + CONCURRENCY);
+    const rows = await Promise.all(chunk.map((msg) => buildMessageRow(businessSlug, session, msg)));
+    await Promise.all(
+      rows.filter((row): row is Record<string, unknown> => row !== null).map((row) => saveMessage(row))
+    );
+    imported += rows.length;
+  }
+
+  console.log(`[${businessSlug}] history import: processed ${imported} messages from the last 2 days`);
+}
+
 export async function startSession(businessSlug: string) {
   ensureDir(config.authDir);
 
   const session: Session = sessions.get(businessSlug) || {
     businessSlug,
     status: "starting",
-    sentMessageIds: new Set()
+    sentMessageIds: new Set(),
+    contactNames: new Map()
   };
 
   session.status = "starting";
@@ -131,12 +251,28 @@ export async function startSession(businessSlug: string) {
       keys: makeCacheableSignalKeyStore(state.keys, logger)
     },
     printQRInTerminal: false,
-    browser: ["Devaux Operations", "Chrome", "1.0.0"]
+    browser: ["Devaux Operations", "Chrome", "1.0.0"],
+    // Needed so Baileys actually requests/emits historical messages (via
+    // messaging-history.set) on link/relink, not just the chat/contact list.
+    syncFullHistory: true
   });
 
   session.socket = socket;
 
   socket.ev.on("creds.update", saveCreds);
+
+  socket.ev.on("contacts.upsert", (contacts) => updateContactNames(session, contacts));
+  socket.ev.on("contacts.update", (contacts) => updateContactNames(session, contacts));
+
+  // Fires once per connection (fresh QR link or session restore) with the
+  // synced backlog. Dispatched, not awaited, so a large import never blocks
+  // the messages.upsert handler below (realtime keeps working throughout).
+  socket.ev.on("messaging-history.set", ({ contacts, messages }) => {
+    updateContactNames(session, contacts);
+    void importHistory(businessSlug, session, messages).catch((err) =>
+      console.error(`[${businessSlug}] history import failed:`, err)
+    );
+  });
 
   socket.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -193,29 +329,18 @@ export async function startSession(businessSlug: string) {
         continue;
       }
 
-      const chatId = msg.key.remoteJid || "";
-      const messageBody = getTextMessage(msg.message);
-      const messageType = getMessageType(msg.message);
-      const mediaUrl = await saveMediaIfAny(businessSlug, msg);
-      const direction = msg.key.fromMe ? "outbound" : "inbound";
+      const row = await buildMessageRow(businessSlug, session, msg);
+      if (!row) continue;
 
-      await saveMessage({
-        business_slug: businessSlug,
-        whatsapp_message_id: msg.key.id,
-        chat_id: chatId,
-        contact_number: contactFromChatId(chatId),
-        contact_name: msg.key.fromMe ? null : msg.pushName || null,
-        message_body: messageBody,
-        message_type: messageType,
-        media_url: mediaUrl,
-        direction,
-        timestamp: msg.messageTimestamp
-          ? new Date(Number(msg.messageTimestamp) * 1000).toISOString()
-          : new Date().toISOString(),
-        raw: msg
-      });
+      if (!msg.key.fromMe) {
+        console.log(`[${businessSlug}] inbound chat_id=${row.chat_id} contact_number=${row.contact_number}`);
+      }
 
-      console.log(`[${businessSlug}] ${direction} ${msg.key.fromMe ? "from phone " : ""}${chatId}: ${messageBody}`);
+      await saveMessage(row);
+
+      console.log(
+        `[${businessSlug}] ${row.direction} ${msg.key.fromMe ? "from phone " : ""}${row.chat_id}: ${row.message_body}`
+      );
     }
   });
 
@@ -273,6 +398,7 @@ export async function sendTextMessage(businessSlug: string, to: string, body: st
     chat_id: chatId,
     contact_number: contactFromChatId(chatId),
     contact_name: null,
+    business_contact_name: getBusinessContactName(session, chatId),
     message_body: body,
     message_type: "text",
     media_url: null,
