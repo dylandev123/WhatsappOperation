@@ -44,3 +44,62 @@ export async function saveMessage(payload: Record<string, unknown>) {
     console.error(payload);
   }
 }
+
+// Pre-delete guard for the retention job (retention.ts), used to gate BOTH
+// local media cleanup and whatsapp_messages row cleanup. Checks whatsapp_sessions
+// (general connectivity) and customers (the durable profile/memory table —
+// see the "profiles are independent of whatsapp_messages" note above
+// deleteStaleMessages()) — if either is unreachable, retention.ts aborts
+// every deletion for the run rather than guessing.
+export async function isSupabaseReachable(): Promise<boolean> {
+  const [sessions, customers] = await Promise.all([
+    supabase.from("whatsapp_sessions").select("business_slug").limit(1),
+    supabase.from("customers").select("id").limit(1)
+  ]);
+  return !sessions.error && !customers.error;
+}
+
+// whatsapp_messages has no foreign key referencing it anywhere in the schema
+// (customers, conversation_status, conversation_analysis, etc. all key off
+// (business_slug, chat_id)/phone_number, never whatsapp_messages.id — see
+// the inbox repo's migrations, e.g. 20260623000700_conversation_status.sql:
+// "Archive / Spam for conversations, without ever touching whatsapp_messages").
+// So deleting old message rows cannot cascade into or otherwise affect
+// customer profiles, AI profile data, or conversation metadata — those are
+// structurally independent of this table's row lifetime.
+export async function countStaleMessages(cutoffIso: string): Promise<number | null> {
+  const { count, error } = await supabase
+    .from("whatsapp_messages")
+    .select("id", { count: "exact", head: true })
+    .lt("timestamp", cutoffIso);
+
+  if (error) {
+    console.error("Supabase count stale messages error:", error.message);
+    return null;
+  }
+  return count ?? 0;
+}
+
+export async function deleteStaleMessages(
+  cutoffIso: string
+): Promise<{ deletedCount: number; error: string | null }> {
+  // Count first (cheap HEAD request), then delete with the same filter —
+  // avoids asking Postgres/PostgREST to return every deleted row just to
+  // report a count, which would be a large payload once the table has
+  // months of history. New rows are always inserted with "now" as their
+  // timestamp, so nothing can newly qualify as ">7 days old" between the
+  // count and the delete below.
+  const staleCount = await countStaleMessages(cutoffIso);
+  if (staleCount === null) {
+    return { deletedCount: 0, error: "failed to count stale messages before delete" };
+  }
+  if (staleCount === 0) {
+    return { deletedCount: 0, error: null };
+  }
+
+  const { error } = await supabase.from("whatsapp_messages").delete().lt("timestamp", cutoffIso);
+  if (error) {
+    return { deletedCount: 0, error: error.message };
+  }
+  return { deletedCount: staleCount, error: null };
+}
