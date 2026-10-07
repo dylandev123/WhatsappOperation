@@ -30,7 +30,23 @@ type Session = {
   // Keyed by both contact.id and contact.jid since either may match a
   // message's remoteJid depending on whether it's a @lid or phone-based jid.
   contactNames: Map<string, string>;
+  // Pending auto-reconnect timer, so a restart (or a second close event) can
+  // cancel it instead of racing it into a second startSession().
+  reconnectTimer?: NodeJS.Timeout;
 };
+
+// Thrown by sendScheduledText when the message provably never reached
+// WhatsApp (no session, not connected, invalid JID). Anything else thrown from
+// a send is ambiguous: the message may or may not have been delivered.
+export class PreSendError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PreSendError";
+  }
+}
+
+const SEND_TIMEOUT_MS = 60_000;
+const SCHEDULED_JID_PATTERN = /^[^@\s]+@(s\.whatsapp\.net|lid|g\.us)$/;
 
 const logger = P({ level: "info" });
 const sessions = new Map<string, Session>();
@@ -256,6 +272,11 @@ export async function startSession(businessSlug: string) {
     contactNames: new Map()
   };
 
+  if (session.reconnectTimer) {
+    clearTimeout(session.reconnectTimer);
+    session.reconnectTimer = undefined;
+  }
+
   session.status = "starting";
   sessions.set(businessSlug, session);
   await upsertSessionStatus(businessSlug, "starting");
@@ -282,6 +303,13 @@ export async function startSession(businessSlug: string) {
 
   session.socket = socket;
 
+  // restartSession() and reconnects replace session.socket while the old
+  // socket can still emit events (notably its own "close"). Only the current
+  // socket may drive session state, reconnects and message saves; otherwise a
+  // stale close schedules a second startSession() and two sockets end up
+  // fighting over the same auth state.
+  const isCurrent = () => session.socket === socket;
+
   socket.ev.on("creds.update", saveCreds);
 
   socket.ev.on("contacts.upsert", (contacts) => updateContactNames(session, contacts));
@@ -298,6 +326,7 @@ export async function startSession(businessSlug: string) {
   });
 
   socket.ev.on("connection.update", async (update) => {
+    if (!isCurrent()) return;
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
@@ -332,12 +361,18 @@ export async function startSession(businessSlug: string) {
       console.log(`[${businessSlug}] disconnected. reconnect=${shouldReconnect}`);
 
       if (shouldReconnect) {
-        setTimeout(() => startSession(businessSlug).catch(console.error), 5000);
+        if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
+        session.reconnectTimer = setTimeout(() => {
+          session.reconnectTimer = undefined;
+          if (!isCurrent()) return;
+          startSession(businessSlug).catch(console.error);
+        }, 5000);
       }
     }
   });
 
   socket.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (!isCurrent()) return;
     if (type !== "notify") return;
 
     for (const msg of messages) {
@@ -404,19 +439,19 @@ export function getQrDataUrl(businessSlug: string) {
   return findSession(businessSlug)?.qrDataUrl || null;
 }
 
-export async function sendTextMessage(businessSlug: string, to: string, body: string) {
-  const session = sessions.get(businessSlug);
-  if (!session?.socket || session.status !== "connected") {
-    throw new Error(`WhatsApp session ${businessSlug} is not connected`);
-  }
-
-  const chatId = to.includes("@") ? to : `${to.replace(/\D/g, "")}@s.whatsapp.net`;
-  const result = await session.socket.sendMessage(chatId, { text: body });
-
+// Saves the outbound row and registers the id so the messages.upsert echo of
+// this send isn't saved twice. saveMessage() never throws (it logs), so a DB
+// failure here can't turn a delivered message into a reported failure.
+async function recordOutbound(
+  session: Session,
+  chatId: string,
+  body: string,
+  result: Awaited<ReturnType<ReturnType<typeof makeWASocket>["sendMessage"]>>
+) {
   if (result?.key?.id) session.sentMessageIds.add(result.key.id);
 
   await saveMessage({
-    business_slug: businessSlug,
+    business_slug: session.businessSlug,
     whatsapp_message_id: result?.key?.id || null,
     chat_id: chatId,
     contact_number: contactFromChatId(chatId),
@@ -429,14 +464,79 @@ export async function sendTextMessage(businessSlug: string, to: string, body: st
     timestamp: new Date().toISOString(),
     raw: result || null
   });
+}
+
+export async function sendTextMessage(businessSlug: string, to: string, body: string) {
+  const session = sessions.get(businessSlug);
+  if (!session?.socket || session.status !== "connected") {
+    throw new Error(`WhatsApp session ${businessSlug} is not connected`);
+  }
+
+  const chatId = to.includes("@") ? to : `${to.replace(/\D/g, "")}@s.whatsapp.net`;
+  const result = await session.socket.sendMessage(chatId, { text: body });
+
+  await recordOutbound(session, chatId, body, result);
 
   return result;
 }
 
+export function isSessionConnected(businessSlug: string): boolean {
+  const session = findSession(businessSlug);
+  return Boolean(session?.socket && session.status === "connected");
+}
+
+// Scheduled sends: the recipient is already a chat JID (@s.whatsapp.net, @lid
+// or @g.us) and is used exactly as stored. Throws PreSendError when nothing
+// could have been sent; any other error means the outcome is unknown.
+export async function sendScheduledText(
+  businessSlug: string,
+  jid: string,
+  body: string
+): Promise<{ messageId: string }> {
+  const session = findSession(businessSlug);
+  if (!session?.socket || session.status !== "connected") {
+    throw new PreSendError(`WhatsApp session ${businessSlug} is not connected`);
+  }
+  if (!SCHEDULED_JID_PATTERN.test(jid)) {
+    throw new PreSendError("Recipient is not a valid chat JID");
+  }
+  if (!body.trim()) {
+    throw new PreSendError("Message body is empty");
+  }
+
+  const socket = session.socket;
+  let timer: NodeJS.Timeout | undefined;
+  let result: Awaited<ReturnType<typeof socket.sendMessage>>;
+  try {
+    result = await Promise.race([
+      socket.sendMessage(jid, { text: body }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("send timed out")), SEND_TIMEOUT_MS);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+
+  const messageId = result?.key?.id;
+  if (!messageId) throw new Error("send returned no message id");
+
+  await recordOutbound(session, jid, body, result);
+  return { messageId };
+}
+
 export async function restartSession(businessSlug: string) {
   const session = sessions.get(businessSlug);
+  if (session?.reconnectTimer) {
+    clearTimeout(session.reconnectTimer);
+    session.reconnectTimer = undefined;
+  }
+  // Detach before ending: startSession() swaps session.socket, and the
+  // isCurrent() guards then ignore anything the old socket still emits.
+  const oldSocket = session?.socket;
+  if (session) session.socket = undefined;
   try {
-    session?.socket?.end(undefined);
+    oldSocket?.end(undefined);
   } catch {}
   return startSession(businessSlug);
 }

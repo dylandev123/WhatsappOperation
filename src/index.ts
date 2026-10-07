@@ -11,6 +11,7 @@ import {
   sendTextMessage,
   startAllSessions
 } from "./whatsapp.js";
+import { sendScheduledTest, startScheduler, stopScheduler, TestSendInputError } from "./scheduler.js";
 
 const app = express();
 
@@ -136,7 +137,47 @@ app.post("/api/send", requireAdmin, async (req, res) => {
   }
 });
 
+// Single-recipient test for a scheduled message. Same send path and
+// classification as scheduled deliveries; `to` must be a chat JID. Pass
+// scheduleId to also record the attempt in the schedule's history.
+app.post("/api/scheduled-messages/test", requireAdmin, async (req, res) => {
+  try {
+    const { businessSlug, to, body, scheduleId } = req.body ?? {};
+
+    if (
+      typeof businessSlug !== "string" ||
+      typeof to !== "string" ||
+      typeof body !== "string" ||
+      (scheduleId !== undefined && typeof scheduleId !== "string")
+    ) {
+      return res.status(400).json({ error: "businessSlug, to, and body are required strings" });
+    }
+
+    const result = await sendScheduledTest({ businessSlug, to, body, scheduleId });
+    const httpStatus = result.status === "sent" ? 200 : result.status === "failed" ? 409 : 502;
+    res.status(httpStatus).json({ ok: result.status === "sent", ...result });
+  } catch (error) {
+    if (error instanceof TestSendInputError) {
+      return res.status(400).json({ error: error.message });
+    }
+    res.status(500).json({
+      error: error instanceof Error ? error.message : "Unknown error"
+    });
+  }
+});
+
 app.listen(config.port, async () => {
   console.log(`Devaux WhatsApp service running on port ${config.port}`);
   await startAllSessions();
+
+  if (config.schedulerEnabled) {
+    startScheduler();
+
+    // Stop claiming new work, let the in-flight delivery finish, then exit.
+    // Only registered when the scheduler runs, so default signal handling is
+    // unchanged otherwise.
+    process.once("SIGTERM", () => {
+      void stopScheduler().finally(() => process.exit(0));
+    });
+  }
 });
