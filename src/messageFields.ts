@@ -49,3 +49,11 @@ export function resolveInboundContactNumber(key: WAMessageKey, chatId: string): 
 export function rowContactNumber(key: WAMessageKey, chatId: string): string {
   return key.fromMe ? contactFromChatId(chatId) : resolveInboundContactNumber(key, chatId);
 }
+
+// contact_number for the agent payload. Same as the saved row, except an @lid
+// chat whose phone WhatsApp never reported yields null: the row's fallback is
+// the @lid's own digits, which must not reach the agent as a phone number.
+export function forwardContactNumber(key: WAMessageKey, chatId: string): string | null {
+  if (chatId.endsWith("@lid") && (key.fromMe || !(key.senderPn || key.participantPn))) return null;
+  return rowContactNumber(key, chatId) || null;
+}

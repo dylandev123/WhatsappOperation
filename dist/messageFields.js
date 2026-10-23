@@ -6,6 +6,7 @@ exports.contactFromChatId = contactFromChatId;
 exports.digitsOnly = digitsOnly;
 exports.resolveInboundContactNumber = resolveInboundContactNumber;
 exports.rowContactNumber = rowContactNumber;
+exports.forwardContactNumber = forwardContactNumber;
 // Pure field extraction shared by the whatsapp_messages row builder
 // (whatsapp.ts) and the AI agent bridge (src/agent), so a forwarded message
 // always carries exactly the chat_id/contact_number/text that was saved.
@@ -54,4 +55,12 @@ function resolveInboundContactNumber(key, chatId) {
 // contact_number exactly as buildMessageRow()/recordOutbound() write it.
 function rowContactNumber(key, chatId) {
     return key.fromMe ? contactFromChatId(chatId) : resolveInboundContactNumber(key, chatId);
+}
+// contact_number for the agent payload. Same as the saved row, except an @lid
+// chat whose phone WhatsApp never reported yields null: the row's fallback is
+// the @lid's own digits, which must not reach the agent as a phone number.
+function forwardContactNumber(key, chatId) {
+    if (chatId.endsWith("@lid") && (key.fromMe || !(key.senderPn || key.participantPn)))
+        return null;
+    return rowContactNumber(key, chatId) || null;
 }

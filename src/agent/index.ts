@@ -56,7 +56,7 @@ export function startAgent(): AgentBridge | null {
   // never for history imports (importHistory() doesn't call them).
   setMessageHooks({
     async onLiveMessage(businessSlug, msg, origin) {
-      await running.onLiveMessage(businessSlug, msg, origin);
+      return running.onLiveMessage(businessSlug, msg, origin);
     }
   });
 

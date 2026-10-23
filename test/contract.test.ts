@@ -19,9 +19,12 @@ describe("contract fixtures parse exactly as the Inbox sends them", () => {
       businessSlug: "dog_food",
       forwardMessages: false,
       mode: "observe",
-      staffGroupJid: null
+      staffGroupJid: null,
+      staffNoticesEnabled: false
     });
     assert.equal(parseConfigResponse(fx.configAssisted).businesses[0].staffGroupJid, fx.STAFF_GROUP);
+    assert.equal(parseConfigResponse(fx.configObserveNotices).businesses[0].staffNoticesEnabled, true);
+    assert.equal(parseConfigResponse(fx.configObserve).businesses[0].staffNoticesEnabled, false);
   });
 
   test("message: done/REPLY keeps send:true; duplicate, error and ignored never send", () => {
@@ -151,6 +154,12 @@ describe("bridge → Inbox payloads", () => {
 
     const lid = bodies.find((b) => b.chatId === fx.LID_JID)!;
     assert.equal(lid.contactNumber, "17585550000"); // same as whatsapp_messages.contact_number
+
+    // Unverified @lid: the @lid's own digits must never be forwarded as a phone number.
+    await env.live(customerMsg(env.clock, "who am i", { chatId: "998877665544@lid" }));
+    await env.settle();
+    const unresolved = env.inbox.calls("/api/bridge/ai-agent/message").map((c) => c.body as Record<string, unknown>).find((b) => b.chatId === "998877665544@lid")!;
+    assert.equal(unresolved.contactNumber, null);
 
     const human = bodies.find((b) => b.fromMe === true && b.chatId === fx.CUSTOMER_JID)!;
     assert.equal(human.contactNumber, fx.CUSTOMER_NUMBER);

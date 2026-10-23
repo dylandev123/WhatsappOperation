@@ -1,5 +1,5 @@
 import type { proto } from "@whiskeysockets/baileys";
-import { getMessageType, getTextMessage, rowContactNumber } from "../messageFields.js";
+import { forwardContactNumber, getMessageType, getTextMessage } from "../messageFields.js";
 import type { ForwardPayload } from "./types.js";
 
 // Turns a live Baileys message into the Inbox /message payload, using the
@@ -49,7 +49,7 @@ export function classifyMessage(msg: proto.IWebMessageInfo): Classification {
   const payload: Omit<ForwardPayload, "businessSlug"> = {
     whatsappMessageId: messageId,
     chatId,
-    contactNumber: rowContactNumber(msg.key, chatId) || null,
+    contactNumber: forwardContactNumber(msg.key, chatId),
     fromMe: Boolean(msg.key.fromMe),
     text,
     hasMedia,

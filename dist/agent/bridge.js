@@ -296,17 +296,37 @@ class AgentBridge {
         let business = await this.businessConfig(entry.businessSlug);
         if (!business)
             return "bridge_config_unavailable";
-        if (business.mode !== "assisted")
-            return "observe_mode";
+        // Observe mode may send ONE thing: a staff_notice to the staff group, and
+        // only when the Inbox has switched staff notices on for this business.
+        // Every other kind (customer replies, holding replies, relays, feedback,
+        // kinds this bridge has never heard of) is blocked, whatever `send` says.
+        const observing = business.mode === "observe";
+        if (business.mode !== "assisted") {
+            if (!observing || entry.kind !== "staff_notice")
+                return "observe_mode";
+            if (!business.staffNoticesEnabled)
+                return "staff_notices_disabled";
+        }
         if (!this.sender.isConnected(entry.businessSlug))
             return "session_disconnected";
         const body = entry.body ?? "";
         if (!body.trim() || body.length > MAX_BODY_LENGTH)
             return "invalid_body";
+        if (observing && !entry.to.endsWith("@g.us"))
+            return "not_staff_group";
         if (entry.to.endsWith("@g.us")) {
             if (entry.to !== business.staffGroupJid)
                 business = await this.businessConfig(entry.businessSlug, true);
-            return business && entry.to === business.staffGroupJid ? null : "not_staff_group";
+            if (!business || entry.to !== business.staffGroupJid)
+                return "not_staff_group";
+            if (observing) {
+                // Flood guard for Observe notices (they are not counted as AI replies below).
+                const minuteAgo = this.now() - 60_000;
+                const recent = Object.values(this.state.outbox).filter((e) => e.businessSlug === entry.businessSlug && e.kind === "staff_notice" && e.sendingAt !== null && e.sendingAt >= minuteAgo);
+                if (recent.length >= this.config.maxBusinessSendsPerMinute)
+                    return "business_rate_limited";
+            }
+            return null;
         }
         if (!DIRECT_JID.test(entry.to))
             return "invalid_recipient";

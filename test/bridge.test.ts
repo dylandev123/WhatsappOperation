@@ -471,3 +471,152 @@ describe("Inbox failures fail closed", () => {
     assert.equal(env.inbox.calls(CLAIM).length, 2);
   });
 });
+
+describe("Observe mode staff notices", () => {
+  const escalate = (extra: Array<{ kind: string; to: string; body: string }> = []) => () => ({
+    decision: "ESCALATE",
+    reasons: ["unverified_question"],
+    items: [{ kind: "staff_notice", to: fx.STAFF_GROUP, body: "🔔 AI escalation #E-7K3QX (NORMAL)" }, ...extra]
+  });
+  const observeNotices = (env: { inbox: { config: unknown } }) => {
+    env.inbox.config = structuredClone(fx.configObserveNotices);
+  };
+
+  test("an escalation notice is sent to the staff group and acked with its WhatsApp id; the customer gets nothing", async (t) => {
+    const env = await setup(t);
+    observeNotices(env);
+    env.inbox.respond = escalate();
+    await env.live(customerMsg(env.clock, "Do you have a vet discount?"));
+    await env.settle();
+    assert.equal(env.sender.sent.length, 1);
+    assert.equal(env.sender.sent[0].jid, fx.STAFF_GROUP);
+    assert.equal(env.sender.sent.filter((s) => s.jid === fx.CUSTOMER_JID).length, 0);
+    assert.equal(acks(env)[0].status, "sent");
+    assert.ok(acks(env)[0].whatsappMessageId);
+  });
+
+  test("customer-bound kinds are blocked even if the Inbox returns them next to the notice", async (t) => {
+    const env = await setup(t);
+    observeNotices(env);
+    env.inbox.misbehaveInObserve = true;
+    env.inbox.respond = escalate([
+      { kind: "holding_reply", to: fx.CUSTOMER_JID, body: "Passed to our team" },
+      { kind: "customer_reply", to: fx.CUSTOMER_JID, body: "We open at 9." },
+      { kind: "staff_relay", to: fx.CUSTOMER_JID, body: "Staff answer" },
+      { kind: "staff_feedback", to: fx.STAFF_GROUP, body: "ack" },
+      { kind: "brand_new_kind", to: fx.CUSTOMER_JID, body: "?" }
+    ]);
+    await env.live(customerMsg(env.clock, "Do you have a vet discount?"));
+    await env.settle();
+    assert.deepEqual(env.sender.sent.map((s) => s.jid), [fx.STAFF_GROUP]);
+    const errors = acks(env).filter((a) => a.status === "failed").map((a) => a.error);
+    assert.equal(errors.length, 5); // everything but the notice
+    assert.ok(errors.every((e) => e === "observe_mode"));
+  });
+
+  test("staff notices switched off (default): the notice is blocked, not sent", async (t) => {
+    const env = await setup(t);
+    env.inbox.config = structuredClone(fx.configObserve);
+    env.inbox.misbehaveInObserve = true;
+    env.inbox.respond = escalate();
+    await env.live(customerMsg(env.clock, "Do you have a vet discount?"));
+    await env.settle();
+    assert.equal(env.sender.attempts, 0);
+    assert.equal(acks(env)[0].error, "staff_notices_disabled");
+  });
+
+  test("an older Inbox that does not send staffNoticesEnabled is treated as off", async (t) => {
+    const env = await setup(t);
+    env.inbox.config = {
+      pollOutboxSeconds: 10,
+      businesses: [{ businessSlug: fx.SLUG, forwardMessages: true, mode: "observe", staffGroupJid: fx.STAFF_GROUP }]
+    };
+    env.inbox.misbehaveInObserve = true;
+    env.inbox.respond = escalate();
+    await env.live(customerMsg(env.clock, "hi"));
+    await env.settle();
+    assert.equal(env.sender.attempts, 0);
+    assert.equal(acks(env)[0].error, "staff_notices_disabled");
+  });
+
+  test("AGENT_SEND_ENABLED=false blocks staff notices too", async (t) => {
+    const env = await setup(t, { config: { sendEnabled: false } });
+    observeNotices(env);
+    env.inbox.respond = escalate();
+    await env.live(customerMsg(env.clock, "Do you have a vet discount?"));
+    await env.settle();
+    assert.equal(env.sender.attempts, 0);
+    assert.equal(acks(env)[0].error, "bridge_send_disabled");
+  });
+
+  test("a staff notice addressed to a customer chat or another business's group is blocked", async (t) => {
+    const env = await setup(t);
+    observeNotices(env);
+    env.inbox.misbehaveInObserve = true;
+    env.inbox.respond = () => ({
+      decision: "ESCALATE",
+      reasons: ["x"],
+      items: [
+        { kind: "staff_notice", to: fx.CUSTOMER_JID, body: "to customer" },
+        { kind: "staff_notice", to: "120363099999999999@g.us", body: "other business group" }
+      ]
+    });
+    await env.live(customerMsg(env.clock, "hi"));
+    await env.settle();
+    assert.equal(env.sender.attempts, 0);
+    assert.deepEqual(acks(env).map((a) => a.error), ["not_staff_group", "not_staff_group"]);
+  });
+
+  test("a repeated forward of the same message sends one notice", async (t) => {
+    const env = await setup(t);
+    observeNotices(env);
+    env.inbox.respond = escalate();
+    const msg = customerMsg(env.clock, "Do you have a vet discount?", { id: "3EB0SAMEMSG0000000001" });
+    await env.live(msg);
+    assert.equal(await env.live(msg), "duplicate");
+    await env.settle();
+    await env.settle();
+    assert.equal(env.inbox.calls(MESSAGE).length, 1);
+    assert.equal(env.sender.sent.length, 1);
+  });
+
+  test("a burst of notices is rate limited per business", async (t) => {
+    const env = await setup(t);
+    observeNotices(env);
+    env.inbox.respond = () => ({
+      decision: "ESCALATE",
+      reasons: ["x"],
+      items: Array.from({ length: 5 }, (_, i) => ({ kind: "staff_notice", to: fx.STAFF_GROUP, body: `notice ${i}` }))
+    });
+    await env.live(customerMsg(env.clock, "hi"));
+    await env.settle();
+    assert.equal(env.sender.sent.length, 3);
+    assert.deepEqual(acks(env).filter((a) => a.status === "failed").map((a) => a.error), ["business_rate_limited", "business_rate_limited"]);
+  });
+
+  test("a staff reply to an Observe notice is forwarded for recording and nothing is sent anywhere", async (t) => {
+    const env = await setup(t);
+    observeNotices(env);
+    env.inbox.respond = (p) =>
+      p.chatId === fx.STAFF_GROUP
+        ? { decision: "NO_REPLY", reasons: ["staff_group_matched:send"], items: [] }
+        : { decision: "ESCALATE", reasons: ["x"], items: [{ kind: "staff_notice", to: fx.STAFF_GROUP, body: "🔔 notice" }] };
+    await env.live(customerMsg(env.clock, "Do you have a vet discount?"));
+    await env.settle();
+    const noticeId = env.sender.sent[0].messageId;
+    await env.live(staffGroupMsg(env.clock, "Yes, 10% for vets", { quoted: noticeId }));
+    await env.settle();
+    const forwarded = env.inbox.calls(MESSAGE).map((c) => c.body as { chatId: string; quotedMessageId: string | null });
+    assert.equal(forwarded.length, 2);
+    assert.equal(forwarded[1].chatId, fx.STAFF_GROUP);
+    assert.equal(forwarded[1].quotedMessageId, noticeId);
+    assert.equal(env.sender.sent.length, 1); // only the notice; the answer is never relayed
+  });
+
+  test("observe: the outbox is still never claimed, even with notices on", async (t) => {
+    const env = await setup(t);
+    observeNotices(env);
+    await env.settle();
+    assert.equal(env.inbox.calls(CLAIM).length, 0);
+  });
+});

@@ -58,7 +58,7 @@ function startAgent() {
     // never for history imports (importHistory() doesn't call them).
     (0, whatsapp_js_1.setMessageHooks)({
         async onLiveMessage(businessSlug, msg, origin) {
-            await running.onLiveMessage(businessSlug, msg, origin);
+            return running.onLiveMessage(businessSlug, msg, origin);
         }
     });
     running.start();

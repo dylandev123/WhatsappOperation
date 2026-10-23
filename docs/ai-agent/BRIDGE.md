@@ -13,7 +13,7 @@ reads or writes none of those tables.
 |---|---|---|
 | `AGENT_ENABLED` | `false` | Forward live messages to `/message`. Off = the agent code never runs. |
 | `AGENT_SEND_ENABLED` | `false` | Send `send: true` items. Off = every returned item is acked `failed` (`bridge_send_disabled`), and `/outbox/claim` is never polled, so admin answers stay `pending`. |
-| Inbox `mode` | `observe` | The inbox produces no outbox in Observe. The bridge also refuses to send unless `/config` says `assisted` (`observe_mode`). |
+| Inbox `mode` | `observe` | The inbox produces no customer-bound outbox in Observe. With `staffNoticesEnabled: true` in `/config` it may return `staff_notice` items for the staff group, and the bridge sends exactly those (never any other kind) provided `AGENT_SEND_ENABLED=true`. Everything else is refused (`observe_mode`; `staff_notices_disabled` when the flag is off). |
 
 Nothing goes to WhatsApp unless all three allow it: `AGENT_ENABLED`, `AGENT_SEND_ENABLED`, and
 the inbox enabled for that business in Assisted mode.
@@ -54,14 +54,14 @@ with the reason as `error`:
 
 | Reason | Applies to |
 |---|---|
-| `bridge_send_disabled`, `observe_mode`, `bridge_config_unavailable`, `session_disconnected`, `invalid_body` | all |
+| `bridge_send_disabled`, `observe_mode`, `staff_notices_disabled`, `bridge_config_unavailable`, `session_disconnected`, `invalid_body` | all |
 | `not_staff_group` | group items whose `to` isn't the configured staff group |
 | `human_takeover` | AI items whose triggering customer message came before a human message in the chat |
 | `superseded_by_newer_message` | `customer_reply` |
 | `stale_reply` | AI items whose trigger is older than `AGENT_MAX_MESSAGE_AGE_MS` |
 | `held_after_unknown_send` | AI items to a chat on hold (see below) |
 | `unapproved_commitment` | `customer_reply` that reads as confirming an order, payment or delivery (backstop to the inbox's own check) |
-| `chat_rate_limited`, `business_rate_limited` | AI items over `AGENT_MAX_CHAT_REPLIES_PER_HOUR` or `AGENT_MAX_BUSINESS_SENDS_PER_MINUTE` |
+| `chat_rate_limited`, `business_rate_limited` | AI items over `AGENT_MAX_CHAT_REPLIES_PER_HOUR` or `AGENT_MAX_BUSINESS_SENDS_PER_MINUTE`; in Observe mode, staff notices are also capped at `AGENT_MAX_BUSINESS_SENDS_PER_MINUTE` |
 
 "AI items" means every kind sent to a customer except `staff_relay`, including kinds the bridge
 doesn't know yet. `staff_relay` is staff-authored, so it is not subject to takeover, supersede,

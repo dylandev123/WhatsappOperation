@@ -73,7 +73,11 @@ function setMessageHooks(hooks) {
 function notifyHooks(businessSlug, msg, origin) {
     if (!messageHooks)
         return;
-    void messageHooks.onLiveMessage(businessSlug, msg, origin).catch((err) => console.error(`[${businessSlug}] agent hook failed:`, err instanceof Error ? err.message : err));
+    void messageHooks.onLiveMessage(businessSlug, msg, origin).then((outcome) => {
+        // Every drop reason used to be discarded silently. Ids/reasons only, no bodies.
+        if (outcome && outcome !== "queued")
+            console.log(`[${businessSlug}] [agent] not forwarded ${msg.key.id}: ${outcome}`);
+    }).catch((err) => console.error(`[${businessSlug}] agent hook failed:`, err instanceof Error ? err.message : err));
 }
 const SEND_TIMEOUT_MS = 60_000;
 const AMBIGUOUS_ECHO_GRACE_MS = 10 * 60_000;
@@ -123,6 +127,13 @@ function updateContactNames(session, contacts) {
         return;
     let namedCount = 0;
     for (const contact of contacts) {
+        const lidJid = contact.lid || (contact.id?.endsWith("@lid") ? contact.id : undefined);
+        const phoneJid = contact.jid || (contact.id?.endsWith("@s.whatsapp.net") ? contact.id : undefined);
+        if (lidJid?.endsWith("@lid") && phoneJid?.endsWith("@s.whatsapp.net")) {
+            const phone = (0, messageFields_js_1.digitsOnly)(phoneJid.split("@")[0].split(":")[0]);
+            if (phone)
+                session.lidToPhone.set(lidJid, phone);
+        }
         if (!contact.name)
             continue;
         namedCount++;
@@ -155,6 +166,18 @@ function takePendingOwnSend(session, msg) {
         }
     }
     return null;
+}
+// An inbound @lid message without senderPn/participantPn gets the phone
+// WhatsApp reported for that @lid (contact events), if any, so the saved row and
+// the agent payload carry a real number instead of the @lid's own digits.
+function addVerifiedPn(session, msg) {
+    const key = msg.key;
+    const jid = key.remoteJid || "";
+    if (key.fromMe || !jid.endsWith("@lid") || key.senderPn || key.participantPn)
+        return;
+    const phone = session.lidToPhone.get(jid);
+    if (phone)
+        key.senderPn = `${phone}@s.whatsapp.net`;
 }
 function getBusinessContactName(session, jid) {
     return session.contactNames.get(jid) ?? null;
@@ -240,7 +263,8 @@ async function startSession(businessSlug) {
         status: "starting",
         sentMessageIds: new Map(),
         pendingOwnSends: new Map(),
-        contactNames: new Map()
+        contactNames: new Map(),
+        lidToPhone: new Map()
     };
     if (session.reconnectTimer) {
         clearTimeout(session.reconnectTimer);
@@ -344,6 +368,7 @@ async function startSession(businessSlug) {
                 continue;
             }
             const pendingOrigin = msg.key.fromMe ? takePendingOwnSend(session, msg) : null;
+            addVerifiedPn(session, msg);
             const row = await buildMessageRow(businessSlug, session, msg);
             if (!row)
                 continue;

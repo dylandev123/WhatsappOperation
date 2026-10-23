@@ -24,7 +24,13 @@ export const configAssisted = {
 
 export const configObserve = {
   pollOutboxSeconds: 10,
-  businesses: [{ businessSlug: SLUG, forwardMessages: true, mode: "observe", staffGroupJid: STAFF_GROUP }]
+  businesses: [{ businessSlug: SLUG, forwardMessages: true, mode: "observe", staffGroupJid: STAFF_GROUP, staffNoticesEnabled: false }]
+};
+
+// Observe with live staff notices switched on (staff_notices_enabled = true).
+export const configObserveNotices = {
+  pollOutboxSeconds: 10,
+  businesses: [{ businessSlug: SLUG, forwardMessages: true, mode: "observe", staffGroupJid: STAFF_GROUP, staffNoticesEnabled: true }]
 };
 
 // POST /api/bridge/ai-agent/message — request, inbound 1:1 (contract 3.2).

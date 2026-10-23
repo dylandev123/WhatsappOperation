@@ -46,6 +46,9 @@ export type BusinessConfig = {
   forwardMessages: boolean;
   mode: "observe" | "assisted" | string;
   staffGroupJid: string | null;
+  // Observe mode: the Inbox permits staff_notice (only) to staffGroupJid.
+  // Absent / anything but true (e.g. an older Inbox) = false.
+  staffNoticesEnabled: boolean;
 };
 
 export type ConfigResponse = {

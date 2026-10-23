@@ -38,7 +38,7 @@ function classifyMessage(msg) {
     const payload = {
         whatsappMessageId: messageId,
         chatId,
-        contactNumber: (0, messageFields_js_1.rowContactNumber)(msg.key, chatId) || null,
+        contactNumber: (0, messageFields_js_1.forwardContactNumber)(msg.key, chatId),
         fromMe: Boolean(msg.key.fromMe),
         text,
         hasMedia,

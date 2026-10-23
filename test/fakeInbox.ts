@@ -38,7 +38,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export class FakeInbox {
   secret: string | null;
-  config: { pollOutboxSeconds: number; businesses: Array<{ businessSlug: string; forwardMessages: boolean; mode: string; staffGroupJid: string | null }> } =
+  config: { pollOutboxSeconds: number; businesses: Array<{ businessSlug: string; forwardMessages: boolean; mode: string; staffGroupJid: string | null; staffNoticesEnabled?: boolean }> } =
     structuredClone(configAssisted);
   // Return items even when not in assisted mode, to prove the bridge's own guard.
   misbehaveInObserve = false;
@@ -172,8 +172,13 @@ export class FakeInbox {
       return send(200, { eventId: key, status: "error", decision: null, reasons: ["internal_error"], outbox: [] });
     }
     this.events.set(key, { decision: scripted.decision, reasons: scripted.reasons });
-    const sendable = settings.mode === "assisted" || this.misbehaveInObserve;
-    const rows = sendable ? scripted.items.map((i) => this.insert(slug, chatId, i, "dispatched", key)) : [];
+    // Mirrors decide.ts outboxAllowed(): Assisted sends everything; Observe only
+    // a staff_notice to the staff group when staff_notices_enabled.
+    const sendable = (i: ScriptedItem) =>
+      settings.mode === "assisted" ||
+      this.misbehaveInObserve ||
+      (settings.mode === "observe" && settings.staffNoticesEnabled === true && i.kind === "staff_notice" && i.to === settings.staffGroupJid);
+    const rows = scripted.items.filter(sendable).map((i) => this.insert(slug, chatId, i, "dispatched", key));
     return send(200, {
       eventId: key,
       status: "done",

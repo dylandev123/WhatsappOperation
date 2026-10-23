@@ -5,7 +5,8 @@ import makeWASocket, {
   useMultiFileAuthState,
   proto,
   downloadMediaMessage,
-  Contact
+  Contact,
+  WAMessageKey
 } from "@whiskeysockets/baileys";
 import P from "pino";
 import QRCode from "qrcode";
@@ -14,7 +15,7 @@ import path from "path";
 import { Boom } from "@hapi/boom";
 import { config } from "./config.js";
 import { saveMessage, upsertSessionStatus } from "./supabase.js";
-import { contactFromChatId, getMessageType, getTextMessage, rowContactNumber } from "./messageFields.js";
+import { contactFromChatId, digitsOnly, getMessageType, getTextMessage, rowContactNumber } from "./messageFields.js";
 
 type Session = {
   businessSlug: string;
@@ -37,6 +38,9 @@ type Session = {
   // Keyed by both contact.id and contact.jid since either may match a
   // message's remoteJid depending on whether it's a @lid or phone-based jid.
   contactNames: Map<string, string>;
+  // @lid JID -> phone digits, only from (lid, phone JID) pairs WhatsApp itself
+  // reported on one contact event. Never inferred from names or digits.
+  lidToPhone: Map<string, string>;
   // Pending auto-reconnect timer, so a restart (or a second close event) can
   // cancel it instead of racing it into a second startSession().
   reconnectTimer?: NodeJS.Timeout;
@@ -58,7 +62,7 @@ export type SendOrigin = "api" | "scheduled" | "agent";
 // live 'notify' messages, after the row is saved; never for history imports.
 // Unset unless AGENT_ENABLED, so existing behavior is unchanged by default.
 export type MessageHooks = {
-  onLiveMessage(businessSlug: string, msg: proto.IWebMessageInfo, origin: SendOrigin | "phone" | null): Promise<void>;
+  onLiveMessage(businessSlug: string, msg: proto.IWebMessageInfo, origin: SendOrigin | "phone" | null): Promise<string | void>;
 };
 let messageHooks: MessageHooks | null = null;
 
@@ -68,7 +72,12 @@ export function setMessageHooks(hooks: MessageHooks | null) {
 
 function notifyHooks(businessSlug: string, msg: proto.IWebMessageInfo, origin: SendOrigin | "phone" | null) {
   if (!messageHooks) return;
-  void messageHooks.onLiveMessage(businessSlug, msg, origin).catch((err) =>
+  void messageHooks.onLiveMessage(businessSlug, msg, origin).then(
+    (outcome) => {
+      // Every drop reason used to be discarded silently. Ids/reasons only, no bodies.
+      if (outcome && outcome !== "queued") console.log(`[${businessSlug}] [agent] not forwarded ${msg.key.id}: ${outcome}`);
+    }
+  ).catch((err) =>
     console.error(`[${businessSlug}] agent hook failed:`, err instanceof Error ? err.message : err)
   );
 }
@@ -138,6 +147,12 @@ function updateContactNames(session: Session, contacts: Array<Partial<Contact>> 
 
   let namedCount = 0;
   for (const contact of contacts) {
+    const lidJid = contact.lid || (contact.id?.endsWith("@lid") ? contact.id : undefined);
+    const phoneJid = contact.jid || (contact.id?.endsWith("@s.whatsapp.net") ? contact.id : undefined);
+    if (lidJid?.endsWith("@lid") && phoneJid?.endsWith("@s.whatsapp.net")) {
+      const phone = digitsOnly(phoneJid.split("@")[0].split(":")[0]);
+      if (phone) session.lidToPhone.set(lidJid, phone);
+    }
     if (!contact.name) continue;
     namedCount++;
     // Root cause of business_contact_name never populating: many chats on
@@ -169,6 +184,17 @@ function takePendingOwnSend(session: Session, msg: proto.IWebMessageInfo): SendO
     }
   }
   return null;
+}
+
+// An inbound @lid message without senderPn/participantPn gets the phone
+// WhatsApp reported for that @lid (contact events), if any, so the saved row and
+// the agent payload carry a real number instead of the @lid's own digits.
+function addVerifiedPn(session: Session, msg: proto.IWebMessageInfo) {
+  const key = msg.key as WAMessageKey;
+  const jid = key.remoteJid || "";
+  if (key.fromMe || !jid.endsWith("@lid") || key.senderPn || key.participantPn) return;
+  const phone = session.lidToPhone.get(jid);
+  if (phone) key.senderPn = `${phone}@s.whatsapp.net`;
 }
 
 function getBusinessContactName(session: Session, jid: string): string | null {
@@ -271,7 +297,8 @@ export async function startSession(businessSlug: string) {
     status: "starting",
     sentMessageIds: new Map(),
     pendingOwnSends: new Map(),
-    contactNames: new Map()
+    contactNames: new Map(),
+    lidToPhone: new Map()
   };
 
   if (session.reconnectTimer) {
@@ -392,6 +419,7 @@ export async function startSession(businessSlug: string) {
       }
 
       const pendingOrigin = msg.key.fromMe ? takePendingOwnSend(session, msg) : null;
+      addVerifiedPn(session, msg);
 
       const row = await buildMessageRow(businessSlug, session, msg);
       if (!row) continue;

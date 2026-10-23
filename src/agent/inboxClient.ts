@@ -66,7 +66,8 @@ export function parseConfigResponse(raw: unknown): ConfigResponse {
             businessSlug: b.businessSlug,
             forwardMessages: b.forwardMessages === true,
             mode: typeof b.mode === "string" ? b.mode : "observe",
-            staffGroupJid: nonEmpty(b.staffGroupJid) ? b.staffGroupJid : null
+            staffGroupJid: nonEmpty(b.staffGroupJid) ? b.staffGroupJid : null,
+            staffNoticesEnabled: b.staffNoticesEnabled === true
           }
         ]
       : []
