@@ -1,4 +1,4 @@
-import type { proto } from "@whiskeysockets/baileys";
+import type { proto, WAMessageKey } from "@whiskeysockets/baileys";
 import { forwardContactNumber, getMessageType, getTextMessage } from "../messageFields.js";
 import type { ForwardPayload } from "./types.js";
 
@@ -24,6 +24,17 @@ function contextInfo(message: proto.IMessage): proto.IContextInfo | null | undef
     message.audioMessage?.contextInfo ??
     message.stickerMessage?.contextInfo
   );
+}
+
+// Phone for an @lid group participant, only when WhatsApp supplied it as
+// participantPn. Never derived from the @lid's own digits; anything that is not
+// a plain phone JID is dropped.
+function verifiedParticipantPhone(key: proto.IMessageKey): string | null {
+  const participant = key.participant || "";
+  if (!participant.endsWith("@lid")) return null;
+  const pn = (key as WAMessageKey).participantPn;
+  const match = typeof pn === "string" ? /^(\d{5,20})(?::\d+)?@s\.whatsapp\.net$/.exec(pn) : null;
+  return match ? match[1] : null;
 }
 
 export function classifyMessage(msg: proto.IWebMessageInfo): Classification {
@@ -55,6 +66,7 @@ export function classifyMessage(msg: proto.IWebMessageInfo): Classification {
     hasMedia,
     quotedMessageId: contextInfo(message)?.stanzaId || null,
     senderJid: isGroup ? msg.key.participant || null : null,
+    senderPhone: isGroup ? verifiedParticipantPhone(msg.key) : null,
     timestamp: new Date(msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now()).toISOString()
   };
   return isGroup ? { kind: "group", payload } : { kind: "direct", payload };

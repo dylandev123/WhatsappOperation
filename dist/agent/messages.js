@@ -13,6 +13,17 @@ function contextInfo(message) {
         message.audioMessage?.contextInfo ??
         message.stickerMessage?.contextInfo);
 }
+// Phone for an @lid group participant, only when WhatsApp supplied it as
+// participantPn. Never derived from the @lid's own digits; anything that is not
+// a plain phone JID is dropped.
+function verifiedParticipantPhone(key) {
+    const participant = key.participant || "";
+    if (!participant.endsWith("@lid"))
+        return null;
+    const pn = key.participantPn;
+    const match = typeof pn === "string" ? /^(\d{5,20})(?::\d+)?@s\.whatsapp\.net$/.exec(pn) : null;
+    return match ? match[1] : null;
+}
 function classifyMessage(msg) {
     const chatId = msg.key.remoteJid || "";
     const messageId = msg.key.id || "";
@@ -44,6 +55,7 @@ function classifyMessage(msg) {
         hasMedia,
         quotedMessageId: contextInfo(message)?.stanzaId || null,
         senderJid: isGroup ? msg.key.participant || null : null,
+        senderPhone: isGroup ? verifiedParticipantPhone(msg.key) : null,
         timestamp: new Date(msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now()).toISOString()
     };
     return isGroup ? { kind: "group", payload } : { kind: "direct", payload };

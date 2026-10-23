@@ -179,6 +179,16 @@ function addVerifiedPn(session, msg) {
     if (phone)
         key.senderPn = `${phone}@s.whatsapp.net`;
 }
+const RECENT_GROUP_MESSAGES = 500;
+function rememberGroupMessage(session, msg) {
+    const jid = msg.key.remoteJid || "";
+    if (!jid.endsWith("@g.us") || !msg.key.id)
+        return;
+    const cache = session.recentGroupMessages;
+    cache.set(`${jid}|${msg.key.id}`, msg);
+    if (cache.size > RECENT_GROUP_MESSAGES)
+        cache.delete(cache.keys().next().value);
+}
 function getBusinessContactName(session, jid) {
     return session.contactNames.get(jid) ?? null;
 }
@@ -264,7 +274,8 @@ async function startSession(businessSlug) {
         sentMessageIds: new Map(),
         pendingOwnSends: new Map(),
         contactNames: new Map(),
-        lidToPhone: new Map()
+        lidToPhone: new Map(),
+        recentGroupMessages: new Map()
     };
     if (session.reconnectTimer) {
         clearTimeout(session.reconnectTimer);
@@ -367,6 +378,7 @@ async function startSession(businessSlug) {
                 notifyHooks(businessSlug, msg, origin);
                 continue;
             }
+            rememberGroupMessage(session, msg);
             const pendingOrigin = msg.key.fromMe ? takePendingOwnSend(session, msg) : null;
             addVerifiedPn(session, msg);
             const row = await buildMessageRow(businessSlug, session, msg);
@@ -460,10 +472,10 @@ async function sendScheduledText(businessSlug, jid, body) {
     return sendGuardedText(businessSlug, jid, body, "scheduled");
 }
 // Same guarded path as scheduled sends, recorded as an agent send.
-async function sendAgentText(businessSlug, jid, body) {
-    return sendGuardedText(businessSlug, jid, body, "agent");
+async function sendAgentText(businessSlug, jid, body, quotedMessageId) {
+    return sendGuardedText(businessSlug, jid, body, "agent", quotedMessageId);
 }
-async function sendGuardedText(businessSlug, jid, body, origin) {
+async function sendGuardedText(businessSlug, jid, body, origin, quotedMessageId) {
     const session = findSession(businessSlug);
     if (!session?.socket || session.status !== "connected") {
         throw new PreSendError(`WhatsApp session ${businessSlug} is not connected`);
@@ -475,13 +487,15 @@ async function sendGuardedText(businessSlug, jid, body, origin) {
         throw new PreSendError("Message body is empty");
     }
     const socket = session.socket;
+    // Group quotes only, and only of a message seen in that same group.
+    const quoted = quotedMessageId && jid.endsWith("@g.us") ? session.recentGroupMessages.get(`${jid}|${quotedMessageId}`) : undefined;
     const token = ++pendingSendSeq;
     session.pendingOwnSends.set(token, { jid, body: body.trim(), origin });
     let timer;
     let result;
     try {
         result = await Promise.race([
-            socket.sendMessage(jid, { text: body }),
+            socket.sendMessage(jid, { text: body }, quoted ? { quoted } : undefined),
             new Promise((_, reject) => {
                 timer = setTimeout(() => reject(new Error("send timed out")), SEND_TIMEOUT_MS);
             })

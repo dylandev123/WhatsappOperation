@@ -41,6 +41,11 @@ const UNKNOWN_RETENTION_MS = 7 * DAY_MS;
 // this bridge doesn't know yet — is treated as AI-generated and gated.
 const HUMAN_AUTHORED_KINDS = new Set(["staff_relay"]);
 
+// Kinds addressed to the staff group, never to a customer, in any mode.
+const STAFF_GROUP_KINDS = new Set(["staff_notice", "staff_draft", "staff_feedback"]);
+// The only kinds Observe mode may send (and only to the staff group).
+const OBSERVE_KINDS = new Set(["staff_notice", "staff_draft"]);
+
 // Defense in depth on top of the Inbox's own reply safety checks: an AI reply
 // that reads as an unapproved commitment is not sent.
 const COMMITMENT_PATTERNS = [
@@ -267,6 +272,7 @@ export class AgentBridge {
       kind: item.kind,
       to: item.to,
       body: item.body,
+      replyToMessageId: item.replyToMessageId ?? null,
       source,
       triggerReceivedAt,
       createdAt: this.now(),
@@ -301,7 +307,11 @@ export class AgentBridge {
       if (this.stopping) return;
       // Claim only what this bridge can send right now: a claimed item is
       // never handed out again.
-      if (!business.forwardMessages || business.mode !== "assisted") continue;
+      // Observe is polled only for staff-group items (batched escalation
+      // notices); the Inbox hands out just what the current mode permits.
+      if (!business.forwardMessages) continue;
+      const observeStaffOnly = business.mode === "observe" && business.staffNoticesEnabled && Boolean(business.staffGroupJid);
+      if (business.mode !== "assisted" && !observeStaffOnly) continue;
       if (!this.sender.isConnected(business.businessSlug)) continue;
       if (this.now() - (this.state.lastClaimAt[business.businessSlug] ?? 0) < pollMs) continue;
       this.state.lastClaimAt[business.businessSlug] = this.now();
@@ -331,28 +341,30 @@ export class AgentBridge {
     if (!this.config.sendEnabled) return "bridge_send_disabled";
     let business = await this.businessConfig(entry.businessSlug);
     if (!business) return "bridge_config_unavailable";
-    // Observe mode may send ONE thing: a staff_notice to the staff group, and
-    // only when the Inbox has switched staff notices on for this business.
-    // Every other kind (customer replies, holding replies, relays, feedback,
-    // kinds this bridge has never heard of) is blocked, whatever `send` says.
+    // Observe mode may send ONE kind of thing: a staff_notice or staff_draft to
+    // the staff group, and only when the Inbox has switched staff notices on for
+    // this business. Every other kind (customer replies, holding replies, relays,
+    // feedback, kinds this bridge has never heard of) is blocked, whatever
+    // `send` says.
     const observing = business.mode === "observe";
     if (business.mode !== "assisted") {
-      if (!observing || entry.kind !== "staff_notice") return "observe_mode";
+      if (!observing || !OBSERVE_KINDS.has(entry.kind)) return "observe_mode";
       if (!business.staffNoticesEnabled) return "staff_notices_disabled";
     }
     if (!this.sender.isConnected(entry.businessSlug)) return "session_disconnected";
     const body = entry.body ?? "";
     if (!body.trim() || body.length > MAX_BODY_LENGTH) return "invalid_body";
-    if (observing && !entry.to.endsWith("@g.us")) return "not_staff_group";
+    // Staff-group kinds never reach a customer chat, in any mode.
+    if ((observing || STAFF_GROUP_KINDS.has(entry.kind)) && !entry.to.endsWith("@g.us")) return "not_staff_group";
 
     if (entry.to.endsWith("@g.us")) {
       if (entry.to !== business.staffGroupJid) business = await this.businessConfig(entry.businessSlug, true);
       if (!business || entry.to !== business.staffGroupJid) return "not_staff_group";
       if (observing) {
-        // Flood guard for Observe notices (they are not counted as AI replies below).
+        // Flood guard for Observe notices and drafts (not counted as AI replies below).
         const minuteAgo = this.now() - 60_000;
         const recent = Object.values(this.state.outbox).filter(
-          (e) => e.businessSlug === entry.businessSlug && e.kind === "staff_notice" && e.sendingAt !== null && e.sendingAt >= minuteAgo
+          (e) => e.businessSlug === entry.businessSlug && OBSERVE_KINDS.has(e.kind) && e.sendingAt !== null && e.sendingAt >= minuteAgo
         );
         if (recent.length >= this.config.maxBusinessSendsPerMinute) return "business_rate_limited";
       }
@@ -416,7 +428,12 @@ export class AgentBridge {
     entry.sendingAt = this.now();
     this.journal.save();
     try {
-      const { messageId } = await this.sender.send(entry.businessSlug, entry.to, entry.body!);
+      const { messageId } = await this.sender.send(
+        entry.businessSlug,
+        entry.to,
+        entry.body!,
+        entry.to.endsWith("@g.us") ? entry.replyToMessageId ?? null : null
+      );
       await this.settle(entry, "sent", messageId, null);
     } catch (error) {
       if (error instanceof NotSentError) return this.settle(entry, "failed", null, `not_sent: ${errorText(error)}`);

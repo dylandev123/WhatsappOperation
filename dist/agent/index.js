@@ -28,9 +28,9 @@ function startAgent() {
         journal: (0, journal_js_1.createFileJournal)(config_js_1.config.agentStateFile, (message) => console.log(`[agent] ${message}`)),
         sender: {
             isConnected: whatsapp_js_1.isSessionConnected,
-            async send(businessSlug, jid, body) {
+            async send(businessSlug, jid, body, quotedMessageId) {
                 try {
-                    return await (0, whatsapp_js_1.sendAgentText)(businessSlug, jid, body);
+                    return await (0, whatsapp_js_1.sendAgentText)(businessSlug, jid, body, quotedMessageId);
                 }
                 catch (error) {
                     if (error instanceof whatsapp_js_1.PreSendError)

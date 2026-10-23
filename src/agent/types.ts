@@ -15,6 +15,9 @@ export type ForwardPayload = {
   hasMedia: boolean;
   quotedMessageId: string | null;
   senderJid: string | null;
+  // Staff group, @lid participants only: the phone WhatsApp itself reported for
+  // the participant (Baileys participantPn). null when unknown; never derived.
+  senderPhone: string | null;
   timestamp: string;
 };
 
@@ -22,7 +25,7 @@ export type InboxDecision = "REPLY" | "ASK" | "ESCALATE" | "NO_REPLY" | "HUMAN";
 export type MessageStatus = "done" | "duplicate" | "in_progress" | "ignored" | "error";
 
 // Known kinds; unknown ones are kept (the contract says honour `send`).
-export type OutboxKind = "customer_reply" | "holding_reply" | "staff_notice" | "staff_feedback" | "staff_relay";
+export type OutboxKind = "customer_reply" | "holding_reply" | "staff_notice" | "staff_draft" | "staff_feedback" | "staff_relay";
 
 export type OutboxItem = {
   id: string;
@@ -31,6 +34,8 @@ export type OutboxItem = {
   to: string;
   body: string;
   send: boolean;
+  // Staff-group items only: WhatsApp id of the message to quote. Optional.
+  replyToMessageId?: string | null;
 };
 
 export type MessageResponse = {
@@ -46,7 +51,7 @@ export type BusinessConfig = {
   forwardMessages: boolean;
   mode: "observe" | "assisted" | string;
   staffGroupJid: string | null;
-  // Observe mode: the Inbox permits staff_notice (only) to staffGroupJid.
+  // Observe mode: the Inbox permits staff_notice and staff_draft (only) to staffGroupJid.
   // Absent / anything but true (e.g. an older Inbox) = false.
   staffNoticesEnabled: boolean;
 };
@@ -99,7 +104,9 @@ export class NotSentError extends Error {
 
 export interface Sender {
   isConnected(businessSlug: string): boolean;
-  send(businessSlug: string, jid: string, body: string): Promise<{ messageId: string }>;
+  // quotedMessageId: best-effort WhatsApp quote of that message in the same chat;
+  // an unquotable message is sent without the quote, never blocked.
+  send(businessSlug: string, jid: string, body: string, quotedMessageId?: string | null): Promise<{ messageId: string }>;
 }
 
 export type AgentConfig = {

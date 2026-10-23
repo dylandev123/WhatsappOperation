@@ -32,11 +32,11 @@ function nonEmpty(value: unknown): value is string {
 
 export function parseOutboxItem(raw: unknown): OutboxItem {
   if (!isObject(raw)) throw new Error("outbox item is not an object");
-  const { id, businessSlug, kind, to, body, send } = raw;
+  const { id, businessSlug, kind, to, body, send, replyToMessageId } = raw;
   if (!nonEmpty(id) || !nonEmpty(businessSlug) || !nonEmpty(kind) || !nonEmpty(to) || typeof body !== "string") {
     throw new Error("outbox item is missing id/businessSlug/kind/to/body");
   }
-  return { id, businessSlug, kind, to, body, send: send === true };
+  return { id, businessSlug, kind, to, body, send: send === true, replyToMessageId: nonEmpty(replyToMessageId) ? replyToMessageId : null };
 }
 
 export function parseMessageResponse(raw: unknown): MessageResponse {

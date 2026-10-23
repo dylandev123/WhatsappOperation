@@ -35,6 +35,8 @@ export type OutboxEntry = {
   to: string;
   // Kept only while the item may still be sent; cleared once settled.
   body: string | null;
+  // Staff-group quote target (optional), kept so a restart still quotes.
+  replyToMessageId?: string | null;
   source: "message" | "claim";
   // When the customer message that produced this item arrived (null for
   // claimed items): drives supersede, takeover and staleness checks.

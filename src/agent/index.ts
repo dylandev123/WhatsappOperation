@@ -27,9 +27,9 @@ export function startAgent(): AgentBridge | null {
     journal: createFileJournal(config.agentStateFile, (message) => console.log(`[agent] ${message}`)),
     sender: {
       isConnected: isSessionConnected,
-      async send(businessSlug, jid, body) {
+      async send(businessSlug, jid, body, quotedMessageId) {
         try {
-          return await sendAgentText(businessSlug, jid, body);
+          return await sendAgentText(businessSlug, jid, body, quotedMessageId);
         } catch (error) {
           if (error instanceof PreSendError) throw new NotSentError(error.message);
           throw error;

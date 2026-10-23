@@ -41,6 +41,9 @@ type Session = {
   // @lid JID -> phone digits, only from (lid, phone JID) pairs WhatsApp itself
   // reported on one contact event. Never inferred from names or digits.
   lidToPhone: Map<string, string>;
+  // Recent group messages by "<group>|<id>", so a staff draft can quote the
+  // staff message it answers. In memory only; a miss just sends unquoted.
+  recentGroupMessages: Map<string, proto.IWebMessageInfo>;
   // Pending auto-reconnect timer, so a restart (or a second close event) can
   // cancel it instead of racing it into a second startSession().
   reconnectTimer?: NodeJS.Timeout;
@@ -197,6 +200,16 @@ function addVerifiedPn(session: Session, msg: proto.IWebMessageInfo) {
   if (phone) key.senderPn = `${phone}@s.whatsapp.net`;
 }
 
+const RECENT_GROUP_MESSAGES = 500;
+
+function rememberGroupMessage(session: Session, msg: proto.IWebMessageInfo) {
+  const jid = msg.key.remoteJid || "";
+  if (!jid.endsWith("@g.us") || !msg.key.id) return;
+  const cache = session.recentGroupMessages;
+  cache.set(`${jid}|${msg.key.id}`, msg);
+  if (cache.size > RECENT_GROUP_MESSAGES) cache.delete(cache.keys().next().value as string);
+}
+
 function getBusinessContactName(session: Session, jid: string): string | null {
   return session.contactNames.get(jid) ?? null;
 }
@@ -298,7 +311,8 @@ export async function startSession(businessSlug: string) {
     sentMessageIds: new Map(),
     pendingOwnSends: new Map(),
     contactNames: new Map(),
-    lidToPhone: new Map()
+    lidToPhone: new Map(),
+    recentGroupMessages: new Map()
   };
 
   if (session.reconnectTimer) {
@@ -418,6 +432,7 @@ export async function startSession(businessSlug: string) {
         continue;
       }
 
+      rememberGroupMessage(session, msg);
       const pendingOrigin = msg.key.fromMe ? takePendingOwnSend(session, msg) : null;
       addVerifiedPn(session, msg);
 
@@ -540,16 +555,18 @@ export async function sendScheduledText(
 export async function sendAgentText(
   businessSlug: string,
   jid: string,
-  body: string
+  body: string,
+  quotedMessageId?: string | null
 ): Promise<{ messageId: string }> {
-  return sendGuardedText(businessSlug, jid, body, "agent");
+  return sendGuardedText(businessSlug, jid, body, "agent", quotedMessageId);
 }
 
 async function sendGuardedText(
   businessSlug: string,
   jid: string,
   body: string,
-  origin: SendOrigin
+  origin: SendOrigin,
+  quotedMessageId?: string | null
 ): Promise<{ messageId: string }> {
   const session = findSession(businessSlug);
   if (!session?.socket || session.status !== "connected") {
@@ -563,13 +580,15 @@ async function sendGuardedText(
   }
 
   const socket = session.socket;
+  // Group quotes only, and only of a message seen in that same group.
+  const quoted = quotedMessageId && jid.endsWith("@g.us") ? session.recentGroupMessages.get(`${jid}|${quotedMessageId}`) : undefined;
   const token = ++pendingSendSeq;
   session.pendingOwnSends.set(token, { jid, body: body.trim(), origin });
   let timer: NodeJS.Timeout | undefined;
   let result: Awaited<ReturnType<typeof socket.sendMessage>>;
   try {
     result = await Promise.race([
-      socket.sendMessage(jid, { text: body }),
+      socket.sendMessage(jid, { text: body }, quoted ? { quoted } : undefined),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error("send timed out")), SEND_TIMEOUT_MS);
       })
