@@ -12,6 +12,7 @@ import {
   startAllSessions
 } from "./whatsapp.js";
 import { sendScheduledTest, startScheduler, stopScheduler, TestSendInputError } from "./scheduler.js";
+import { getAgent, startAgent, stopAgent } from "./agent/index.js";
 
 const app = express();
 
@@ -166,18 +167,45 @@ app.post("/api/scheduled-messages/test", requireAdmin, async (req, res) => {
   }
 });
 
+app.get("/api/agent/status", requireAdmin, (_req, res) => {
+  const agent = getAgent();
+  res.json({
+    enabled: config.agentEnabled,
+    running: Boolean(agent),
+    sendEnabled: config.agentSendEnabled,
+    ...(agent ? agent.status() : {})
+  });
+});
+
+// Clears the bridge's local send hold on a chat after a send whose outcome
+// was unknown (check the customer's chat first). Takeover/resume is owned by
+// the inbox (/admin/ai-agent, or !takeover / !resume in the staff group).
+app.post("/api/agent/holds/clear", requireAdmin, (req, res) => {
+  const agent = getAgent();
+  if (!agent) return res.status(409).json({ error: "Agent is not running" });
+  const { businessSlug, chatId } = req.body ?? {};
+  if (typeof businessSlug !== "string" || typeof chatId !== "string") {
+    return res.status(400).json({ error: "businessSlug and chatId are required strings" });
+  }
+  res.json({ ok: true, cleared: agent.clearHold(businessSlug, chatId) });
+});
+
 app.listen(config.port, async () => {
   console.log(`Devaux WhatsApp service running on port ${config.port}`);
   await startAllSessions();
 
-  if (config.schedulerEnabled) {
-    startScheduler();
+  if (config.schedulerEnabled) startScheduler();
+  const agent = startAgent();
 
-    // Stop claiming new work, let the in-flight delivery finish, then exit.
-    // Only registered when the scheduler runs, so default signal handling is
-    // unchanged otherwise.
+  // Stop claiming new work, let in-flight sends finish, then exit. Only
+  // registered when a worker runs, so default signal handling is unchanged
+  // otherwise.
+  if (config.schedulerEnabled || agent) {
     process.once("SIGTERM", () => {
-      void stopScheduler().finally(() => process.exit(0));
+      void Promise.allSettled([
+        config.schedulerEnabled ? stopScheduler() : Promise.resolve(),
+        stopAgent()
+      ]).finally(() => process.exit(0));
     });
   }
 });

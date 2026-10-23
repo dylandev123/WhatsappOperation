@@ -5,7 +5,6 @@ import makeWASocket, {
   useMultiFileAuthState,
   proto,
   downloadMediaMessage,
-  WAMessageKey,
   Contact
 } from "@whiskeysockets/baileys";
 import P from "pino";
@@ -15,6 +14,7 @@ import path from "path";
 import { Boom } from "@hapi/boom";
 import { config } from "./config.js";
 import { saveMessage, upsertSessionStatus } from "./supabase.js";
+import { contactFromChatId, getMessageType, getTextMessage, rowContactNumber } from "./messageFields.js";
 
 type Session = {
   businessSlug: string;
@@ -22,9 +22,16 @@ type Session = {
   qr?: string;
   qrDataUrl?: string;
   status: "starting" | "qr" | "connected" | "disconnected";
-  // IDs of messages sendTextMessage() already saved directly, so the
+  // IDs of messages this service already saved directly, so the
   // messages.upsert echo of that same send (fromMe: true) isn't saved twice.
-  sentMessageIds: Set<string>;
+  // The value records who sent it, so the agent can tell a manual staff send
+  // (/api/send) from its own and the scheduler's.
+  sentMessageIds: Map<string, SendOrigin>;
+  // Guarded sends whose sendMessage() hasn't resolved (or ended ambiguously),
+  // keyed by token. An echo that arrives before the id is registered above is
+  // matched here by chat + body, so a bot or scheduled send can never be
+  // mistaken for a manual message from the phone.
+  pendingOwnSends: Map<number, { jid: string; body: string; origin: SendOrigin }>;
   // JID -> device/saved contact name (Baileys Contact.name), from
   // contacts.upsert/contacts.update and the messaging-history.set backfill.
   // Keyed by both contact.id and contact.jid since either may match a
@@ -45,7 +52,30 @@ export class PreSendError extends Error {
   }
 }
 
+export type SendOrigin = "api" | "scheduled" | "agent";
+
+// Optional observers for the Assisted AI Agent (src/agent). Called only for
+// live 'notify' messages, after the row is saved; never for history imports.
+// Unset unless AGENT_ENABLED, so existing behavior is unchanged by default.
+export type MessageHooks = {
+  onLiveMessage(businessSlug: string, msg: proto.IWebMessageInfo, origin: SendOrigin | "phone" | null): Promise<void>;
+};
+let messageHooks: MessageHooks | null = null;
+
+export function setMessageHooks(hooks: MessageHooks | null) {
+  messageHooks = hooks;
+}
+
+function notifyHooks(businessSlug: string, msg: proto.IWebMessageInfo, origin: SendOrigin | "phone" | null) {
+  if (!messageHooks) return;
+  void messageHooks.onLiveMessage(businessSlug, msg, origin).catch((err) =>
+    console.error(`[${businessSlug}] agent hook failed:`, err instanceof Error ? err.message : err)
+  );
+}
+
 const SEND_TIMEOUT_MS = 60_000;
+const AMBIGUOUS_ECHO_GRACE_MS = 10 * 60_000;
+let pendingSendSeq = 0;
 const SCHEDULED_JID_PATTERN = /^[^@\s]+@(s\.whatsapp\.net|lid|g\.us)$/;
 
 const logger = P({ level: "info" });
@@ -56,46 +86,6 @@ const HISTORY_IMPORT_WINDOW_SECONDS = 2 * 24 * 60 * 60;
 
 function ensureDir(dir: string) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-}
-
-function getTextMessage(message?: proto.IMessage | null): string {
-  if (!message) return "";
-  return (
-    message.conversation ||
-    message.extendedTextMessage?.text ||
-    message.imageMessage?.caption ||
-    message.videoMessage?.caption ||
-    message.documentMessage?.caption ||
-    ""
-  );
-}
-
-function getMessageType(message?: proto.IMessage | null): string {
-  if (!message) return "unknown";
-  if (message.conversation || message.extendedTextMessage) return "text";
-  if (message.imageMessage) return "image";
-  if (message.videoMessage) return "video";
-  if (message.documentMessage) return "document";
-  if (message.audioMessage) return "audio";
-  if (message.stickerMessage) return "sticker";
-  return "unknown";
-}
-
-function contactFromChatId(chatId: string): string {
-  return chatId.replace("@s.whatsapp.net", "").replace("@g.us", "");
-}
-
-function digitsOnly(value: string): string {
-  return value.replace(/[^0-9]/g, "");
-}
-
-// remoteJid can be a WhatsApp @lid privacy id (not a real, dialable number)
-// instead of the contact's actual phone number. senderPn/participantPn carry
-// the real number when Baileys has it, so prefer those for inbound messages;
-// fall back to remoteJid only when neither is present. Digits-only strips
-// @s.whatsapp.net/@lid (and anything else non-numeric) in one step.
-function resolveInboundContactNumber(key: WAMessageKey, chatId: string): string {
-  return digitsOnly(key.senderPn || key.participantPn || chatId);
 }
 
 async function saveMediaIfAny(businessSlug: string, message: proto.IWebMessageInfo) {
@@ -152,7 +142,7 @@ function updateContactNames(session: Session, contacts: Array<Partial<Contact>> 
     namedCount++;
     // Root cause of business_contact_name never populating: many chats on
     // this account are keyed by the WhatsApp @lid privacy id rather than the
-    // phone-based jid (see resolveInboundContactNumber above), but the saved
+    // phone-based jid (see resolveInboundContactNumber in messageFields.ts), but the saved
     // name only ever arrived indexed by contact.id/contact.jid (the
     // phone-based jid) — contact.lid was never stored, so a message whose
     // chat_id is the @lid form could never match. Index all three forms.
@@ -166,6 +156,19 @@ function updateContactNames(session: Session, contacts: Array<Partial<Contact>> 
   console.log(
     `[${session.businessSlug}] contact event: received=${contacts.length} withSavedName=${namedCount} mapSize=${session.contactNames.size}`
   );
+}
+
+function takePendingOwnSend(session: Session, msg: proto.IWebMessageInfo): SendOrigin | null {
+  const jid = msg.key.remoteJid || "";
+  const body = getTextMessage(msg.message).trim();
+  if (!jid || !body) return null;
+  for (const [token, pending] of session.pendingOwnSends) {
+    if (pending.jid === jid && pending.body === body) {
+      session.pendingOwnSends.delete(token);
+      return pending.origin;
+    }
+  }
+  return null;
 }
 
 function getBusinessContactName(session: Session, jid: string): string | null {
@@ -187,9 +190,7 @@ async function buildMessageRow(
   const messageType = getMessageType(msg.message);
   const mediaUrl = await saveMediaIfAny(businessSlug, msg);
   const direction = msg.key.fromMe ? "outbound" : "inbound";
-  const contactNumber = msg.key.fromMe
-    ? contactFromChatId(chatId)
-    : resolveInboundContactNumber(msg.key, chatId);
+  const contactNumber = rowContactNumber(msg.key, chatId);
   const businessContactName = getBusinessContactName(session, chatId);
 
   // TEMPORARY diagnostic log — remove once business_contact_name is
@@ -268,7 +269,8 @@ export async function startSession(businessSlug: string) {
   const session: Session = sessions.get(businessSlug) || {
     businessSlug,
     status: "starting",
-    sentMessageIds: new Set(),
+    sentMessageIds: new Map(),
+    pendingOwnSends: new Map(),
     contactNames: new Map()
   };
 
@@ -383,9 +385,13 @@ export async function startSession(businessSlug: string) {
       // the phone directly (not through the app) are fromMe too, but have no
       // entry here, so they still fall through and get saved below.
       if (msg.key.fromMe && msg.key.id && session.sentMessageIds.has(msg.key.id)) {
+        const origin = session.sentMessageIds.get(msg.key.id) ?? null;
         session.sentMessageIds.delete(msg.key.id);
+        notifyHooks(businessSlug, msg, origin);
         continue;
       }
+
+      const pendingOrigin = msg.key.fromMe ? takePendingOwnSend(session, msg) : null;
 
       const row = await buildMessageRow(businessSlug, session, msg);
       if (!row) continue;
@@ -399,6 +405,8 @@ export async function startSession(businessSlug: string) {
       console.log(
         `[${businessSlug}] ${row.direction} ${msg.key.fromMe ? "from phone " : ""}${row.chat_id}: ${row.message_body}`
       );
+
+      notifyHooks(businessSlug, msg, pendingOrigin ?? (msg.key.fromMe ? "phone" : null));
     }
   });
 
@@ -446,9 +454,10 @@ async function recordOutbound(
   session: Session,
   chatId: string,
   body: string,
-  result: Awaited<ReturnType<ReturnType<typeof makeWASocket>["sendMessage"]>>
+  result: Awaited<ReturnType<ReturnType<typeof makeWASocket>["sendMessage"]>>,
+  origin: SendOrigin
 ) {
-  if (result?.key?.id) session.sentMessageIds.add(result.key.id);
+  if (result?.key?.id) session.sentMessageIds.set(result.key.id, origin);
 
   await saveMessage({
     business_slug: session.businessSlug,
@@ -475,7 +484,10 @@ export async function sendTextMessage(businessSlug: string, to: string, body: st
   const chatId = to.includes("@") ? to : `${to.replace(/\D/g, "")}@s.whatsapp.net`;
   const result = await session.socket.sendMessage(chatId, { text: body });
 
-  await recordOutbound(session, chatId, body, result);
+  await recordOutbound(session, chatId, body, result, "api");
+  // Echoes of app sends usually arrive as 'append' (ignored above), so tell
+  // the agent directly: a send from the inbox is a manual staff reply.
+  if (result?.key) notifyHooks(businessSlug, { key: result.key, message: result.message, messageTimestamp: result.messageTimestamp }, "api");
 
   return result;
 }
@@ -493,6 +505,24 @@ export async function sendScheduledText(
   jid: string,
   body: string
 ): Promise<{ messageId: string }> {
+  return sendGuardedText(businessSlug, jid, body, "scheduled");
+}
+
+// Same guarded path as scheduled sends, recorded as an agent send.
+export async function sendAgentText(
+  businessSlug: string,
+  jid: string,
+  body: string
+): Promise<{ messageId: string }> {
+  return sendGuardedText(businessSlug, jid, body, "agent");
+}
+
+async function sendGuardedText(
+  businessSlug: string,
+  jid: string,
+  body: string,
+  origin: SendOrigin
+): Promise<{ messageId: string }> {
   const session = findSession(businessSlug);
   if (!session?.socket || session.status !== "connected") {
     throw new PreSendError(`WhatsApp session ${businessSlug} is not connected`);
@@ -505,6 +535,8 @@ export async function sendScheduledText(
   }
 
   const socket = session.socket;
+  const token = ++pendingSendSeq;
+  session.pendingOwnSends.set(token, { jid, body: body.trim(), origin });
   let timer: NodeJS.Timeout | undefined;
   let result: Awaited<ReturnType<typeof socket.sendMessage>>;
   try {
@@ -514,14 +546,22 @@ export async function sendScheduledText(
         timer = setTimeout(() => reject(new Error("send timed out")), SEND_TIMEOUT_MS);
       })
     ]);
+  } catch (error) {
+    // Outcome unknown: a late echo may still arrive, so keep it recognisable.
+    setTimeout(() => session.pendingOwnSends.delete(token), AMBIGUOUS_ECHO_GRACE_MS).unref();
+    throw error;
   } finally {
     if (timer) clearTimeout(timer);
   }
 
   const messageId = result?.key?.id;
-  if (!messageId) throw new Error("send returned no message id");
+  if (!messageId) {
+    setTimeout(() => session.pendingOwnSends.delete(token), AMBIGUOUS_ECHO_GRACE_MS).unref();
+    throw new Error("send returned no message id");
+  }
+  session.pendingOwnSends.delete(token);
 
-  await recordOutbound(session, jid, body, result);
+  await recordOutbound(session, jid, body, result, origin);
   return { messageId };
 }
 

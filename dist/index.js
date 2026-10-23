@@ -9,6 +9,8 @@ const path_1 = __importDefault(require("path"));
 const config_js_1 = require("./config.js");
 const auth_js_1 = require("./auth.js");
 const whatsapp_js_1 = require("./whatsapp.js");
+const scheduler_js_1 = require("./scheduler.js");
+const index_js_1 = require("./agent/index.js");
 const app = (0, express_1.default)();
 app.use((0, cors_1.default)());
 app.use(express_1.default.json({ limit: "10mb" }));
@@ -118,7 +120,68 @@ app.post("/api/send", auth_js_1.requireAdmin, async (req, res) => {
         });
     }
 });
+// Single-recipient test for a scheduled message. Same send path and
+// classification as scheduled deliveries; `to` must be a chat JID. Pass
+// scheduleId to also record the attempt in the schedule's history.
+app.post("/api/scheduled-messages/test", auth_js_1.requireAdmin, async (req, res) => {
+    try {
+        const { businessSlug, to, body, scheduleId } = req.body ?? {};
+        if (typeof businessSlug !== "string" ||
+            typeof to !== "string" ||
+            typeof body !== "string" ||
+            (scheduleId !== undefined && typeof scheduleId !== "string")) {
+            return res.status(400).json({ error: "businessSlug, to, and body are required strings" });
+        }
+        const result = await (0, scheduler_js_1.sendScheduledTest)({ businessSlug, to, body, scheduleId });
+        const httpStatus = result.status === "sent" ? 200 : result.status === "failed" ? 409 : 502;
+        res.status(httpStatus).json({ ok: result.status === "sent", ...result });
+    }
+    catch (error) {
+        if (error instanceof scheduler_js_1.TestSendInputError) {
+            return res.status(400).json({ error: error.message });
+        }
+        res.status(500).json({
+            error: error instanceof Error ? error.message : "Unknown error"
+        });
+    }
+});
+app.get("/api/agent/status", auth_js_1.requireAdmin, (_req, res) => {
+    const agent = (0, index_js_1.getAgent)();
+    res.json({
+        enabled: config_js_1.config.agentEnabled,
+        running: Boolean(agent),
+        sendEnabled: config_js_1.config.agentSendEnabled,
+        ...(agent ? agent.status() : {})
+    });
+});
+// Clears the bridge's local send hold on a chat after a send whose outcome
+// was unknown (check the customer's chat first). Takeover/resume is owned by
+// the inbox (/admin/ai-agent, or !takeover / !resume in the staff group).
+app.post("/api/agent/holds/clear", auth_js_1.requireAdmin, (req, res) => {
+    const agent = (0, index_js_1.getAgent)();
+    if (!agent)
+        return res.status(409).json({ error: "Agent is not running" });
+    const { businessSlug, chatId } = req.body ?? {};
+    if (typeof businessSlug !== "string" || typeof chatId !== "string") {
+        return res.status(400).json({ error: "businessSlug and chatId are required strings" });
+    }
+    res.json({ ok: true, cleared: agent.clearHold(businessSlug, chatId) });
+});
 app.listen(config_js_1.config.port, async () => {
     console.log(`Devaux WhatsApp service running on port ${config_js_1.config.port}`);
     await (0, whatsapp_js_1.startAllSessions)();
+    if (config_js_1.config.schedulerEnabled)
+        (0, scheduler_js_1.startScheduler)();
+    const agent = (0, index_js_1.startAgent)();
+    // Stop claiming new work, let in-flight sends finish, then exit. Only
+    // registered when a worker runs, so default signal handling is unchanged
+    // otherwise.
+    if (config_js_1.config.schedulerEnabled || agent) {
+        process.once("SIGTERM", () => {
+            void Promise.allSettled([
+                config_js_1.config.schedulerEnabled ? (0, scheduler_js_1.stopScheduler)() : Promise.resolve(),
+                (0, index_js_1.stopAgent)()
+            ]).finally(() => process.exit(0));
+        });
+    }
 });

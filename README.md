@@ -86,6 +86,23 @@ curl -X POST "http://YOUR_SERVER_IP:3030/api/send" \
 
 Use country code in the phone number.
 
+## Inbox AI agent bridge (off by default)
+
+`src/agent/` connects this service to the inbox's AI agent. The inbox decides
+everything (eligibility, replies, `#E-XXXXX` escalations, staff commands,
+takeover, order requests, audit). This service forwards live messages to
+`/api/bridge/ai-agent/message`, sends only the returned `send: true` items
+verbatim, and acks each one. It never forwards history imports, scheduled
+sends or its own sends. Disabled unless `AGENT_ENABLED=true`. Sends nothing
+unless `AGENT_SEND_ENABLED=true` and the inbox has the business in Assisted
+mode. The contract is `docs/ai-agent-bridge-contract.md` in the inbox repo.
+Bridge specifics are in `docs/ai-agent/BRIDGE.md`.
+
+```bash
+npm run typecheck
+npm test
+```
+
 ## Suggested next version
 
 - Add a Devaux Operations inbox page

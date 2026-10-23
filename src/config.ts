@@ -36,6 +36,24 @@ export const config = {
   // 'sending' rows older than this become 'unknown' and are never retried.
   schedulerStaleSendingMs: positiveInt("SCHEDULER_STALE_SENDING_MS", 120_000),
   schedulerWorkerId: process.env.SCHEDULER_WORKER_ID || `bridge-${process.pid}`,
+  // Inbox AI agent bridge (src/agent; contract owned by the inbox repo,
+  // docs/ai-agent-bridge-contract.md). Off unless explicitly enabled; even
+  // when enabled nothing is sent to WhatsApp unless AGENT_SEND_ENABLED is
+  // also true AND the inbox has the business in Assisted mode.
+  agentEnabled: process.env.AGENT_ENABLED === "true",
+  agentSendEnabled: process.env.AGENT_SEND_ENABLED === "true",
+  aiAgentUrl: process.env.AI_AGENT_URL || "",
+  aiAgentBridgeSecret: process.env.AI_AGENT_BRIDGE_SECRET || "",
+  agentStateFile: process.env.AGENT_STATE_FILE || "./auth/agent-bridge-state.json",
+  agentBatchWindowMs: positiveInt("AGENT_BATCH_WINDOW_MS", 10_000),
+  agentTickMs: positiveInt("AGENT_TICK_MS", 2_000),
+  agentConfigTtlMs: positiveInt("AGENT_CONFIG_TTL_MS", 60_000),
+  agentMaxMessageAgeMs: positiveInt("AGENT_MAX_MESSAGE_AGE_MS", 10 * 60_000),
+  agentMaxChatRepliesPerHour: positiveInt("AGENT_MAX_CHAT_REPLIES_PER_HOUR", 4),
+  agentMaxBusinessSendsPerMinute: positiveInt("AGENT_MAX_BUSINESS_SENDS_PER_MINUTE", 3),
+  agentMinSendGapMs: positiveInt("AGENT_MIN_SEND_GAP_MS", 5_000),
+  agentMaxForwardAttempts: positiveInt("AGENT_MAX_FORWARD_ATTEMPTS", 3),
+  agentUnknownSendHoldMs: positiveInt("AGENT_UNKNOWN_SEND_HOLD_MS", 6 * 60 * 60_000),
   authDir: "./auth",
   mediaDir: "./media"
 };
