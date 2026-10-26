@@ -13,7 +13,7 @@ reads or writes none of those tables.
 |---|---|---|
 | `AGENT_ENABLED` | `false` | Forward live messages to `/message`. Off = the agent code never runs. |
 | `AGENT_SEND_ENABLED` | `false` | Send `send: true` items. Off = every returned item is acked `failed` (`bridge_send_disabled`), and `/outbox/claim` is never polled, so admin answers stay `pending`. |
-| Inbox `mode` | `observe` | The inbox produces no customer-bound outbox in Observe. With `staffNoticesEnabled: true` in `/config` it may return `staff_notice` items for the staff group, and the bridge sends exactly those (never any other kind) provided `AGENT_SEND_ENABLED=true`. Everything else is refused (`observe_mode`; `staff_notices_disabled` when the flag is off). |
+| Inbox `mode` | `observe` | The inbox produces no customer-bound outbox in Observe. With `staffNoticesEnabled: true` in `/config` it may return `staff_notice` and `staff_draft` items for the staff group, and the bridge sends exactly those (never any other kind) provided `AGENT_SEND_ENABLED=true`. Everything else is refused (`observe_mode`; `staff_notices_disabled` when the flag is off). |
 
 Nothing goes to WhatsApp unless all three allow it: `AGENT_ENABLED`, `AGENT_SEND_ENABLED`, and
 the inbox enabled for that business in Assisted mode.
@@ -24,7 +24,7 @@ Only live `messages.upsert` (`notify`) messages and the inbox's own `/api/send` 
 
 - inbound 1:1 messages (text or media; media-only goes with `hasMedia: true`, and the inbox escalates it)
 - `fromMe` 1:1 messages a human sent (phone or `/api/send`), which trigger the inbox's takeover
-- every message in the configured `staffGroupJid`, `fromMe` included
+- every message in the configured `staffGroupJid`, `fromMe` included. Each carries `senderJid` (the group participant, as WhatsApp reported it; null when WhatsApp gives none, e.g. `fromMe`) and, for `@lid` participants only, `senderPhone` from Baileys `participantPn` (null otherwise; never derived from the `@lid` digits). `quotedMessageId` is the exact quoted WhatsApp id.
 
 Never forwarded:
 
@@ -71,7 +71,7 @@ rate or hold checks. `AGENT_MIN_SEND_GAP_MS` spaces out all sends.
 
 | Outcome | Ack | Inbox outbox status |
 |---|---|---|
-| sent | `sent` + Baileys id (the inbox needs this to match quoted replies to `staff_notice`) | `sent` |
+| sent | `sent` + Baileys id (the inbox needs this to match quoted replies to `staff_notice` and `staff_draft`) | `sent` |
 | provably not sent (`PreSendError`) or blocked | `failed` + reason | `failed` |
 | ambiguous (timeout, socket error, crash mid-send) | **none** | stays `dispatched` |
 
@@ -102,3 +102,30 @@ If the journal is lost, nothing is resent. Re-forwarded messages come back `dupl
 
 - `GET /api/agent/status`: switches, inbox config as seen, queue sizes, unknown sends, holds
 - `POST /api/agent/holds/clear`: clears a hold. Takeover and resume belong to the inbox (`/admin/ai-agent`, `!takeover` / `!resume`).
+
+## Staff drafts and quoting
+
+`staff_draft` is a staff-group kind like `staff_notice`: allowed in Observe only with `staffNoticesEnabled`,
+blocked by `AGENT_SEND_ENABLED=false`, and refused (`not_staff_group`) if addressed to anything but the
+configured staff group, in every mode (also `staff_notice` / `staff_feedback`). `replyToMessageId` is
+posted as a WhatsApp quote of that message when the bridge has seen it in the group recently (in-memory,
+last 500 group messages); otherwise the draft is sent unquoted. A quote can never block a send.
+
+`/outbox/claim` is also polled for Observe businesses with `staffNoticesEnabled` and a staff group, so
+batched-escalation notices are delivered without new traffic. The Inbox only hands out items the mode
+permits, and the bridge's own Observe checks still apply to whatever it receives.
+
+## Approval Pilot mode
+
+`/config` may report `mode: "approval_pilot"` (between Observe and Assisted). The AI never sends on its own there. The bridge sends,
+provided `AGENT_SEND_ENABLED=true`, only:
+
+- `staff_notice`, `staff_draft`, `staff_feedback` to the configured staff group (`staffNoticesEnabled` is not needed), and
+- `staff_relay`: a reply an explicitly authorized staff member approved in the staff group (`!approve`, `!send <text>`) or an admin sent from the
+  dashboard. Human-authored, so the AI-reply checks (age, takeover, rate limits, commitment patterns) do not apply, but a hold after a send of unknown
+  outcome (`held_after_unknown_send`) does.
+
+Everything else (`customer_reply`, `holding_reply`, unknown kinds, a `staff_relay` addressed to a group) is refused and acked `failed` with
+`approval_pilot_mode`. `/outbox/claim` is polled in this mode. An unknown mode still fails closed (`observe_mode`). The Inbox returns the draft's
+approved text verbatim; the bridge never edits it. Deploy this bridge **before** switching any business to Approval Pilot.
+

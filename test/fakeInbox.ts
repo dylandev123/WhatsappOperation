@@ -26,9 +26,10 @@ export type OutboxRow = {
   whatsapp_message_id: string | null;
   error: string | null;
   event_key: string | null;
+  reply_to: string | null;
 };
 
-export type ScriptedItem = { kind: string; to: string; body: string };
+export type ScriptedItem = { kind: string; to: string; body: string; replyToMessageId?: string };
 export type Scripted = { decision: string; reasons: string[]; items: ScriptedItem[] } | "error" | "throw";
 export type Payload = Record<string, unknown> & { businessSlug: string; whatsappMessageId: string; chatId: string; fromMe: boolean; text: string };
 
@@ -49,6 +50,7 @@ export class FakeInbox {
   events = new Map<string, { decision: string | null; reasons: string[] }>();
   requests: RecordedRequest[] = [];
   noticeMessageIds: string[] = [];
+  draftMessageIds: string[] = [];
 
   private server = http.createServer((req, res) => void this.handle(req, res));
   url = "";
@@ -86,14 +88,15 @@ export class FakeInbox {
       status,
       whatsapp_message_id: null,
       error: null,
-      event_key: eventKey
+      event_key: eventKey,
+      reply_to: item.replyToMessageId ?? null
     };
     this.outbox.push(row);
     return row;
   }
 
   private bridgeItem(row: OutboxRow, send: boolean) {
-    return { id: row.id, businessSlug: row.business_slug, kind: row.kind, to: row.to_jid, body: row.body, send };
+    return { id: row.id, businessSlug: row.business_slug, kind: row.kind, to: row.to_jid, body: row.body, send, replyToMessageId: row.reply_to };
   }
 
   private async handle(req: http.IncomingMessage, res: http.ServerResponse) {
@@ -126,8 +129,15 @@ export class FakeInbox {
     if (path === "/api/bridge/ai-agent/outbox/claim") {
       const b = (body ?? {}) as { businessSlug?: string; limit?: number };
       const limit = typeof b.limit === "number" ? Math.max(1, Math.min(100, Math.floor(b.limit))) : 20;
+      // outbox.ts claimOutbox: only what the business's current mode permits.
+      const permitted = (r: OutboxRow) => {
+        const s = this.config.businesses.find((x) => x.businessSlug === r.business_slug);
+        if (s?.mode === "assisted") return true;
+        if (s?.mode === "approval_pilot") return r.kind === "staff_relay" || (["staff_notice", "staff_draft", "staff_feedback"].includes(r.kind) && r.to_jid === s.staffGroupJid);
+        return s?.mode === "observe" && s.staffNoticesEnabled === true && (r.kind === "staff_notice" || r.kind === "staff_draft") && r.to_jid === s.staffGroupJid;
+      };
       const rows = this.outbox
-        .filter((r) => r.status === "pending" && (!b.businessSlug || r.business_slug === b.businessSlug))
+        .filter((r) => r.status === "pending" && permitted(r) && (!b.businessSlug || r.business_slug === b.businessSlug))
         .slice(0, limit);
       for (const r of rows) r.status = "dispatched";
       return send(200, { items: rows.map((r) => this.bridgeItem(r, true)) });
@@ -173,11 +183,12 @@ export class FakeInbox {
     }
     this.events.set(key, { decision: scripted.decision, reasons: scripted.reasons });
     // Mirrors decide.ts outboxAllowed(): Assisted sends everything; Observe only
-    // a staff_notice to the staff group when staff_notices_enabled.
+    // a staff_notice/staff_draft to the staff group when staff_notices_enabled.
     const sendable = (i: ScriptedItem) =>
       settings.mode === "assisted" ||
+      (settings.mode === "approval_pilot" && (i.kind === "staff_relay" || ["staff_notice", "staff_draft", "staff_feedback"].includes(i.kind))) ||
       this.misbehaveInObserve ||
-      (settings.mode === "observe" && settings.staffNoticesEnabled === true && i.kind === "staff_notice" && i.to === settings.staffGroupJid);
+      (settings.mode === "observe" && settings.staffNoticesEnabled === true && (i.kind === "staff_notice" || i.kind === "staff_draft") && i.to === settings.staffGroupJid);
     const rows = scripted.items.filter(sendable).map((i) => this.insert(slug, chatId, i, "dispatched", key));
     return send(200, {
       eventId: key,
@@ -200,6 +211,7 @@ export class FakeInbox {
     row.whatsapp_message_id = typeof b.whatsappMessageId === "string" ? b.whatsappMessageId : null;
     row.error = typeof b.error === "string" ? b.error : null;
     if (row.status === "sent" && row.kind === "staff_notice" && row.whatsapp_message_id) this.noticeMessageIds.push(row.whatsapp_message_id);
+    if (row.status === "sent" && row.kind === "staff_draft" && row.whatsapp_message_id) this.draftMessageIds.push(row.whatsapp_message_id);
     return send(200, { ok: true });
   }
 }

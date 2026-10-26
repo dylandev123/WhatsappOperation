@@ -20,7 +20,7 @@ export type SendMode = "ok" | "not_sent" | "ambiguous";
 export class FakeSender implements Sender {
   connected = true;
   mode: SendMode = "ok";
-  sent: Array<{ businessSlug: string; jid: string; body: string; messageId: string }> = [];
+  sent: Array<{ businessSlug: string; jid: string; body: string; messageId: string; quotedMessageId: string | null }> = [];
   attempts = 0;
   // Called just before a send resolves (e.g. a human types meanwhile).
   beforeSend: (() => Promise<void> | void) | null = null;
@@ -30,13 +30,13 @@ export class FakeSender implements Sender {
     return this.connected;
   }
 
-  async send(businessSlug: string, jid: string, body: string) {
+  async send(businessSlug: string, jid: string, body: string, quotedMessageId: string | null = null) {
     this.attempts += 1;
     if (this.beforeSend) await this.beforeSend();
     if (this.mode === "not_sent") throw new NotSentError("WhatsApp session dog_food is not connected");
     if (this.mode === "ambiguous") throw new Error("send timed out");
     const messageId = `3EB0BOT${String(++this.seq).padStart(13, "0")}`;
-    this.sent.push({ businessSlug, jid, body, messageId });
+    this.sent.push({ businessSlug, jid, body, messageId, quotedMessageId });
     return { messageId };
   }
 }
@@ -71,9 +71,9 @@ export function phoneMsg(clock: Clock, text: string, chatId = CUSTOMER_JID): pro
   return { key: { remoteJid: chatId, fromMe: true, id: nextId() }, message: { conversation: text }, messageTimestamp: Math.floor(clock.now() / 1000) };
 }
 
-export function staffGroupMsg(clock: Clock, text: string, opts: { quoted?: string; participant?: string; fromMe?: boolean; group?: string } = {}): proto.IWebMessageInfo {
+export function staffGroupMsg(clock: Clock, text: string, opts: { quoted?: string; participant?: string; participantPn?: string; fromMe?: boolean; group?: string } = {}): proto.IWebMessageInfo {
   return {
-    key: { remoteJid: opts.group ?? STAFF_GROUP, fromMe: opts.fromMe ?? false, id: nextId(), participant: opts.fromMe ? undefined : opts.participant ?? STAFF_MEMBER },
+    key: { remoteJid: opts.group ?? STAFF_GROUP, fromMe: opts.fromMe ?? false, id: nextId(), participant: opts.fromMe ? undefined : opts.participant ?? STAFF_MEMBER, ...(opts.participantPn ? { participantPn: opts.participantPn } : {}) } as proto.IMessageKey,
     message: opts.quoted ? { extendedTextMessage: { text, contextInfo: { stanzaId: opts.quoted } } } : { conversation: text },
     messageTimestamp: Math.floor(clock.now() / 1000)
   };

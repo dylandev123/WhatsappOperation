@@ -45,6 +45,9 @@ const HUMAN_AUTHORED_KINDS = new Set(["staff_relay"]);
 const STAFF_GROUP_KINDS = new Set(["staff_notice", "staff_draft", "staff_feedback"]);
 // The only kinds Observe mode may send (and only to the staff group).
 const OBSERVE_KINDS = new Set(["staff_notice", "staff_draft"]);
+// Approval Pilot: the AI never sends on its own. Staff-group kinds, plus staff_relay — a reply an explicitly
+// authorized staff member approved (!approve / !send / the dashboard button). Nothing else, whatever `send` says.
+const PILOT_KINDS = new Set([...STAFF_GROUP_KINDS, "staff_relay"]);
 
 // Defense in depth on top of the Inbox's own reply safety checks: an AI reply
 // that reads as an unapproved commitment is not sent.
@@ -311,7 +314,8 @@ export class AgentBridge {
       // notices); the Inbox hands out just what the current mode permits.
       if (!business.forwardMessages) continue;
       const observeStaffOnly = business.mode === "observe" && business.staffNoticesEnabled && Boolean(business.staffGroupJid);
-      if (business.mode !== "assisted" && !observeStaffOnly) continue;
+      // Approval Pilot is polled for approved sends and staff-group posts; the Inbox hands out only what its mode permits.
+      if (business.mode !== "assisted" && business.mode !== "approval_pilot" && !observeStaffOnly) continue;
       if (!this.sender.isConnected(business.businessSlug)) continue;
       if (this.now() - (this.state.lastClaimAt[business.businessSlug] ?? 0) < pollMs) continue;
       this.state.lastClaimAt[business.businessSlug] = this.now();
@@ -347,7 +351,12 @@ export class AgentBridge {
     // feedback, kinds this bridge has never heard of) is blocked, whatever
     // `send` says.
     const observing = business.mode === "observe";
-    if (business.mode !== "assisted") {
+    const pilot = business.mode === "approval_pilot";
+    if (pilot) {
+      // Approval Pilot: only PILOT_KINDS, and a staff_relay only to a customer — never into the staff group.
+      if (!PILOT_KINDS.has(entry.kind)) return "approval_pilot_mode";
+      if (entry.kind === "staff_relay" && entry.to.endsWith("@g.us")) return "approval_pilot_mode";
+    } else if (business.mode !== "assisted") {
       if (!observing || !OBSERVE_KINDS.has(entry.kind)) return "observe_mode";
       if (!business.staffNoticesEnabled) return "staff_notices_disabled";
     }
@@ -360,18 +369,26 @@ export class AgentBridge {
     if (entry.to.endsWith("@g.us")) {
       if (entry.to !== business.staffGroupJid) business = await this.businessConfig(entry.businessSlug, true);
       if (!business || entry.to !== business.staffGroupJid) return "not_staff_group";
-      if (observing) {
-        // Flood guard for Observe notices and drafts (not counted as AI replies below).
+      if (observing || pilot) {
+        // Flood guard for Observe / Approval Pilot staff-group posts (not counted as AI replies below).
         const minuteAgo = this.now() - 60_000;
+        const groupKinds = observing ? OBSERVE_KINDS : STAFF_GROUP_KINDS;
         const recent = Object.values(this.state.outbox).filter(
-          (e) => e.businessSlug === entry.businessSlug && OBSERVE_KINDS.has(e.kind) && e.sendingAt !== null && e.sendingAt >= minuteAgo
+          (e) => e.businessSlug === entry.businessSlug && groupKinds.has(e.kind) && e.sendingAt !== null && e.sendingAt >= minuteAgo
         );
         if (recent.length >= this.config.maxBusinessSendsPerMinute) return "business_rate_limited";
       }
       return null;
     }
     if (!DIRECT_JID.test(entry.to)) return "invalid_recipient";
-    if (HUMAN_AUTHORED_KINDS.has(entry.kind)) return null;
+    if (HUMAN_AUTHORED_KINDS.has(entry.kind)) {
+      // An approved pilot send still respects a hold after a send whose outcome is unknown.
+      if (pilot) {
+        const held = this.state.holds[chatKey(entry.businessSlug, entry.to)];
+        if (held && held.until > this.now()) return "held_after_unknown_send";
+      }
+      return null;
+    }
 
     // AI-generated message to a customer.
     const chat = chatKey(entry.businessSlug, entry.to);

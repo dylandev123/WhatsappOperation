@@ -613,9 +613,9 @@ describe("Observe mode staff notices", () => {
     assert.equal(env.sender.sent.length, 1); // only the notice; the answer is never relayed
   });
 
-  test("observe: the outbox is still never claimed, even with notices on", async (t) => {
+  test("observe: the outbox is not claimed unless staff notices are on", async (t) => {
     const env = await setup(t);
-    observeNotices(env);
+    env.inbox.config = structuredClone(fx.configObserve);
     await env.settle();
     assert.equal(env.inbox.calls(CLAIM).length, 0);
   });

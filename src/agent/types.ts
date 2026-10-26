@@ -49,7 +49,7 @@ export type MessageResponse = {
 export type BusinessConfig = {
   businessSlug: string;
   forwardMessages: boolean;
-  mode: "observe" | "assisted" | string;
+  mode: "observe" | "approval_pilot" | "assisted" | string;
   staffGroupJid: string | null;
   // Observe mode: the Inbox permits staff_notice and staff_draft (only) to staffGroupJid.
   // Absent / anything but true (e.g. an older Inbox) = false.

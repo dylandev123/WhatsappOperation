@@ -33,6 +33,12 @@ export const configObserveNotices = {
   businesses: [{ businessSlug: SLUG, forwardMessages: true, mode: "observe", staffGroupJid: STAFF_GROUP, staffNoticesEnabled: true }]
 };
 
+// Approval Pilot: the AI never sends on its own; an authorized staff approval (staff_relay) can. No staffNoticesEnabled needed.
+export const configPilot = {
+  pollOutboxSeconds: 10,
+  businesses: [{ businessSlug: SLUG, forwardMessages: true, mode: "approval_pilot", staffGroupJid: STAFF_GROUP }]
+};
+
 // POST /api/bridge/ai-agent/message — request, inbound 1:1 (contract 3.2).
 export const messageRequestInbound = {
   businessSlug: SLUG,
@@ -44,6 +50,7 @@ export const messageRequestInbound = {
   hasMedia: false,
   quotedMessageId: null,
   senderJid: null,
+  senderPhone: null,
   timestamp: "2026-10-22T14:03:11.000Z"
 };
 
