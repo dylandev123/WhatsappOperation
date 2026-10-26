@@ -47,6 +47,8 @@ const STAFF_GROUP_KINDS = new Set(["staff_notice", "staff_draft", "staff_feedbac
 const OBSERVE_KINDS = new Set(["staff_notice", "staff_draft"]);
 // Approval Pilot: the AI never sends on its own. Staff-group kinds, plus staff_relay — a reply an explicitly
 // authorized staff member approved (!approve / !send / the dashboard button). Nothing else, whatever `send` says.
+const ORDERS_GROUP_KINDS = new Set(["staff_notice", "staff_feedback"]);
+const ORDERS_GROUP_OBSERVE_KINDS = new Set(["staff_notice"]);
 const PILOT_KINDS = new Set([...STAFF_GROUP_KINDS, "staff_relay"]);
 
 // Defense in depth on top of the Inbox's own reply safety checks: an AI reply
@@ -148,7 +150,9 @@ export class AgentBridge {
     const payload = { ...classified.payload, businessSlug };
     let role: ForwardRole;
     if (classified.kind === "group") {
-      if (!business.staffGroupJid || payload.chatId !== business.staffGroupJid) return "not_staff_group";
+      const inStaffGroup = Boolean(business.staffGroupJid) && payload.chatId === business.staffGroupJid;
+      const inOrdersGroup = Boolean(business.ordersGroupJid) && payload.chatId === business.ordersGroupJid;
+      if (!inStaffGroup && !inOrdersGroup) return "not_staff_group";
       role = "staff_group";
     } else if (payload.fromMe) {
       role = "human"; // business phone or the inbox's /api/send
@@ -313,7 +317,7 @@ export class AgentBridge {
       // Observe is polled only for staff-group items (batched escalation
       // notices); the Inbox hands out just what the current mode permits.
       if (!business.forwardMessages) continue;
-      const observeStaffOnly = business.mode === "observe" && business.staffNoticesEnabled && Boolean(business.staffGroupJid);
+      const observeStaffOnly = business.mode === "observe" && business.staffNoticesEnabled && Boolean(business.staffGroupJid || business.ordersGroupJid);
       // Approval Pilot is polled for approved sends and staff-group posts; the Inbox hands out only what its mode permits.
       if (business.mode !== "assisted" && business.mode !== "approval_pilot" && !observeStaffOnly) continue;
       if (!this.sender.isConnected(business.businessSlug)) continue;
@@ -367,8 +371,13 @@ export class AgentBridge {
     if ((observing || STAFF_GROUP_KINDS.has(entry.kind)) && !entry.to.endsWith("@g.us")) return "not_staff_group";
 
     if (entry.to.endsWith("@g.us")) {
-      if (entry.to !== business.staffGroupJid) business = await this.businessConfig(entry.businessSlug, true);
-      if (!business || entry.to !== business.staffGroupJid) return "not_staff_group";
+      if (entry.to !== business.staffGroupJid && entry.to !== business.ordersGroupJid) business = await this.businessConfig(entry.businessSlug, true);
+      if (!business) return "not_staff_group";
+      if (entry.to !== business.staffGroupJid) {
+        // The separate Orders group takes the order summary and refusals to "!update" only: never drafts or relays.
+        const ordersKinds = observing ? ORDERS_GROUP_OBSERVE_KINDS : ORDERS_GROUP_KINDS;
+        if (!business.ordersGroupJid || entry.to !== business.ordersGroupJid || !ordersKinds.has(entry.kind)) return "not_staff_group";
+      }
       if (observing || pilot) {
         // Flood guard for Observe / Approval Pilot staff-group posts (not counted as AI replies below).
         const minuteAgo = this.now() - 60_000;

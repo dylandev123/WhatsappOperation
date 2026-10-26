@@ -39,7 +39,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export class FakeInbox {
   secret: string | null;
-  config: { pollOutboxSeconds: number; businesses: Array<{ businessSlug: string; forwardMessages: boolean; mode: string; staffGroupJid: string | null; staffNoticesEnabled?: boolean }> } =
+  config: { pollOutboxSeconds: number; businesses: Array<{ businessSlug: string; forwardMessages: boolean; mode: string; staffGroupJid: string | null; staffNoticesEnabled?: boolean; ordersGroupJid?: string | null }> } =
     structuredClone(configAssisted);
   // Return items even when not in assisted mode, to prove the bridge's own guard.
   misbehaveInObserve = false;
@@ -133,8 +133,9 @@ export class FakeInbox {
       const permitted = (r: OutboxRow) => {
         const s = this.config.businesses.find((x) => x.businessSlug === r.business_slug);
         if (s?.mode === "assisted") return true;
-        if (s?.mode === "approval_pilot") return r.kind === "staff_relay" || (["staff_notice", "staff_draft", "staff_feedback"].includes(r.kind) && r.to_jid === s.staffGroupJid);
-        return s?.mode === "observe" && s.staffNoticesEnabled === true && (r.kind === "staff_notice" || r.kind === "staff_draft") && r.to_jid === s.staffGroupJid;
+        const toOrders = Boolean(s?.ordersGroupJid) && r.to_jid === s?.ordersGroupJid && r.kind === "staff_notice";
+        if (s?.mode === "approval_pilot") return r.kind === "staff_relay" || toOrders || (["staff_notice", "staff_draft", "staff_feedback"].includes(r.kind) && r.to_jid === s.staffGroupJid);
+        return s?.mode === "observe" && s.staffNoticesEnabled === true && (toOrders || ((r.kind === "staff_notice" || r.kind === "staff_draft") && r.to_jid === s.staffGroupJid));
       };
       const rows = this.outbox
         .filter((r) => r.status === "pending" && permitted(r) && (!b.businessSlug || r.business_slug === b.businessSlug))
@@ -188,7 +189,7 @@ export class FakeInbox {
       settings.mode === "assisted" ||
       (settings.mode === "approval_pilot" && (i.kind === "staff_relay" || ["staff_notice", "staff_draft", "staff_feedback"].includes(i.kind))) ||
       this.misbehaveInObserve ||
-      (settings.mode === "observe" && settings.staffNoticesEnabled === true && (i.kind === "staff_notice" || i.kind === "staff_draft") && i.to === settings.staffGroupJid);
+      (settings.mode === "observe" && settings.staffNoticesEnabled === true && ((i.kind === "staff_notice" || i.kind === "staff_draft") && i.to === settings.staffGroupJid || (i.kind === "staff_notice" && Boolean(settings.ordersGroupJid) && i.to === settings.ordersGroupJid)));
     const rows = scripted.items.filter(sendable).map((i) => this.insert(slug, chatId, i, "dispatched", key));
     return send(200, {
       eventId: key,

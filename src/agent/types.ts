@@ -54,6 +54,9 @@ export type BusinessConfig = {
   // Observe mode: the Inbox permits staff_notice and staff_draft (only) to staffGroupJid.
   // Absent / anything but true (e.g. an older Inbox) = false.
   staffNoticesEnabled: boolean;
+  // Daily order summary: a separate group that receives the summary (staff_notice) and where "!update" is typed.
+  // null / absent (an older Inbox, or no separate group) = the staff group is used and nothing changes.
+  ordersGroupJid?: string | null;
 };
 
 export type ConfigResponse = {

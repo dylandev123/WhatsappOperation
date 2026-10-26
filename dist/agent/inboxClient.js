@@ -59,7 +59,8 @@ function parseConfigResponse(raw) {
                 forwardMessages: b.forwardMessages === true,
                 mode: typeof b.mode === "string" ? b.mode : "observe",
                 staffGroupJid: nonEmpty(b.staffGroupJid) ? b.staffGroupJid : null,
-                staffNoticesEnabled: b.staffNoticesEnabled === true
+                staffNoticesEnabled: b.staffNoticesEnabled === true,
+                ...(nonEmpty(b.ordersGroupJid) ? { ordersGroupJid: b.ordersGroupJid } : {})
             }
         ]
         : []);
