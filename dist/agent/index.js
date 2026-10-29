@@ -6,6 +6,7 @@ exports.stopAgent = stopAgent;
 const config_js_1 = require("../config.js");
 const whatsapp_js_1 = require("../whatsapp.js");
 const bridge_js_1 = require("./bridge.js");
+const calls_js_1 = require("./calls.js");
 const inboxClient_js_1 = require("./inboxClient.js");
 const journal_js_1 = require("./journal.js");
 const types_js_1 = require("./types.js");
@@ -54,11 +55,21 @@ function startAgent() {
         }
     });
     const running = bridge;
+    const calls = new calls_js_1.CallTracker();
     // Hooks fire only for live 'notify' messages and inbox /api/send sends —
     // never for history imports (importHistory() doesn't call them).
     (0, whatsapp_js_1.setMessageHooks)({
         async onLiveMessage(businessSlug, msg, origin) {
             return running.onLiveMessage(businessSlug, msg, origin);
+        },
+        onCallEvents(businessSlug, events, selfIds) {
+            for (const event of events) {
+                const report = calls.handle(businessSlug, event, selfIds);
+                if (!report)
+                    continue;
+                const { businessSlug: _slug, ...rest } = report;
+                void running.onCallReport(businessSlug, rest).then((outcome) => console.log(`[${businessSlug}] [agent] call ${report.callId} ${report.finalStatus}: ${outcome}`), (err) => console.error(`[${businessSlug}] agent call hook failed:`, err instanceof Error ? err.message : err));
+            }
         }
     });
     running.start();

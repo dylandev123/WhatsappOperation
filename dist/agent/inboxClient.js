@@ -60,7 +60,9 @@ function parseConfigResponse(raw) {
                 mode: typeof b.mode === "string" ? b.mode : "observe",
                 staffGroupJid: nonEmpty(b.staffGroupJid) ? b.staffGroupJid : null,
                 staffNoticesEnabled: b.staffNoticesEnabled === true,
-                ...(nonEmpty(b.ordersGroupJid) ? { ordersGroupJid: b.ordersGroupJid } : {})
+                ...(nonEmpty(b.ordersGroupJid) ? { ordersGroupJid: b.ordersGroupJid } : {}),
+                ...(Array.isArray(b.routedGroupJids) ? { routedGroupJids: b.routedGroupJids.filter((j) => nonEmpty(j) && j.endsWith("@g.us")) } : {}),
+                ...(b.missedCallsEnabled === true ? { missedCallsEnabled: true } : {})
             }
         ]
         : []);
@@ -112,6 +114,17 @@ function createInboxClient(options) {
             catch (error) {
                 // The Inbox processed it but we can't read the answer: send nothing.
                 throw new types_js_1.InboxHttpError(`message response invalid: ${error instanceof Error ? error.message : error}`, res.status, false);
+            }
+        },
+        async reportCall(payload) {
+            const res = await call("POST", "/api/bridge/ai-agent/call", payload, DEFAULT_TIMEOUT_MS);
+            if (!res.ok)
+                throw new types_js_1.InboxHttpError(`call returned ${res.status}`, res.status, retryableStatus(res.status));
+            try {
+                return parseMessageResponse(res.json);
+            }
+            catch (error) {
+                throw new types_js_1.InboxHttpError(`call response invalid: ${error instanceof Error ? error.message : error}`, res.status, false);
             }
         },
         async ack(payload) {

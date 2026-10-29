@@ -360,6 +360,18 @@ async function startSession(businessSlug) {
             }
         }
     });
+    // Calls are only observed (never answered, rejected or stored here); the agent decides whether a finished call was a missed one.
+    socket.ev.on("call", (events) => {
+        if (!isCurrent() || !messageHooks?.onCallEvents)
+            return;
+        const me = socket.user;
+        try {
+            messageHooks.onCallEvents(businessSlug, events, [me?.id, me?.lid]);
+        }
+        catch (err) {
+            console.error(`[${businessSlug}] call hook failed:`, err instanceof Error ? err.message : err);
+        }
+    });
     socket.ev.on("messages.upsert", async ({ messages, type }) => {
         if (!isCurrent())
             return;

@@ -39,7 +39,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export class FakeInbox {
   secret: string | null;
-  config: { pollOutboxSeconds: number; businesses: Array<{ businessSlug: string; forwardMessages: boolean; mode: string; staffGroupJid: string | null; staffNoticesEnabled?: boolean; ordersGroupJid?: string | null }> } =
+  config: { pollOutboxSeconds: number; businesses: Array<{ businessSlug: string; forwardMessages: boolean; mode: string; staffGroupJid: string | null; staffNoticesEnabled?: boolean; ordersGroupJid?: string | null; routedGroupJids?: string[]; missedCallsEnabled?: boolean }> } =
     structuredClone(configAssisted);
   // Return items even when not in assisted mode, to prove the bridge's own guard.
   misbehaveInObserve = false;
@@ -125,6 +125,7 @@ export class FakeInbox {
     if (body === null && raw) return send(400, { error: "Invalid JSON body" });
 
     if (path === "/api/bridge/ai-agent/message") return this.message(body as Record<string, unknown> | null, send);
+    if (path === "/api/bridge/ai-agent/call") return this.call(body as Record<string, unknown> | null, send);
     if (path === "/api/bridge/ai-agent/ack") return this.ack(body as Record<string, unknown> | null, send);
     if (path === "/api/bridge/ai-agent/outbox/claim") {
       const b = (body ?? {}) as { businessSlug?: string; limit?: number };
@@ -134,8 +135,9 @@ export class FakeInbox {
         const s = this.config.businesses.find((x) => x.businessSlug === r.business_slug);
         if (s?.mode === "assisted") return true;
         const toOrders = Boolean(s?.ordersGroupJid) && r.to_jid === s?.ordersGroupJid && r.kind === "staff_notice";
-        if (s?.mode === "approval_pilot") return r.kind === "staff_relay" || toOrders || (["staff_notice", "staff_draft", "staff_feedback"].includes(r.kind) && r.to_jid === s.staffGroupJid);
-        return s?.mode === "observe" && s.staffNoticesEnabled === true && (toOrders || ((r.kind === "staff_notice" || r.kind === "staff_draft") && r.to_jid === s.staffGroupJid));
+        const toRouted = Boolean(s?.routedGroupJids?.includes(r.to_jid));
+        if (s?.mode === "approval_pilot") return r.kind === "staff_relay" || toOrders || (r.kind === "missed_call_reply" && s.missedCallsEnabled === true) || (["staff_notice", "staff_draft", "staff_feedback"].includes(r.kind) && (r.to_jid === s.staffGroupJid || toRouted));
+        return s?.mode === "observe" && s.staffNoticesEnabled === true && (toOrders || ((r.kind === "staff_notice" || r.kind === "staff_draft") && (r.to_jid === s.staffGroupJid || toRouted)));
       };
       const rows = this.outbox
         .filter((r) => r.status === "pending" && permitted(r) && (!b.businessSlug || r.business_slug === b.businessSlug))
@@ -144,6 +146,18 @@ export class FakeInbox {
       return send(200, { items: rows.map((r) => this.bridgeItem(r, true)) });
     }
     return send(404, { error: "not found" });
+  }
+
+  // What the Inbox answers to a call report: scripted per test (default: nothing to send).
+  callRespond: (payload: Record<string, unknown>) => ScriptedItem[] = () => [];
+
+  private call(b: Record<string, unknown> | null, send: (s: number, j: unknown) => void) {
+    if (!b) return send(400, { error: "Invalid JSON body" });
+    const slug = typeof b.businessSlug === "string" ? b.businessSlug : null;
+    if (!slug || typeof b.callId !== "string" || typeof b.callerJid !== "string") return send(400, { error: "businessSlug, callId, callerJid and finalStatus are required" });
+    const items = this.callRespond(b);
+    const rows = items.map((i) => this.insert(slug, b.callerJid as string, i, "dispatched", `call|${slug}|${b.callId}`));
+    return send(200, { status: rows.length ? "done" : "ignored", decision: rows.length ? "replied" : "skipped", reason: rows.length ? "replied" : "skipped", outbox: rows.map((r) => this.bridgeItem(r, true)) });
   }
 
   private message(b: Record<string, unknown> | null, send: (s: number, j: unknown) => void) {

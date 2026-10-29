@@ -3,6 +3,7 @@ import {
   type AckPayload,
   type AckResult,
   type BusinessConfig,
+  type CallReportPayload,
   type ConfigResponse,
   type ForwardPayload,
   type InboxClient,
@@ -68,7 +69,9 @@ export function parseConfigResponse(raw: unknown): ConfigResponse {
             mode: typeof b.mode === "string" ? b.mode : "observe",
             staffGroupJid: nonEmpty(b.staffGroupJid) ? b.staffGroupJid : null,
             staffNoticesEnabled: b.staffNoticesEnabled === true,
-            ...(nonEmpty(b.ordersGroupJid) ? { ordersGroupJid: b.ordersGroupJid } : {})
+            ...(nonEmpty(b.ordersGroupJid) ? { ordersGroupJid: b.ordersGroupJid } : {}),
+            ...(Array.isArray(b.routedGroupJids) ? { routedGroupJids: b.routedGroupJids.filter((j): j is string => nonEmpty(j) && j.endsWith("@g.us")) } : {}),
+            ...(b.missedCallsEnabled === true ? { missedCallsEnabled: true } : {})
           }
         ]
       : []
@@ -121,6 +124,16 @@ export function createInboxClient(options: { baseUrl: string; secret: string; fe
       } catch (error) {
         // The Inbox processed it but we can't read the answer: send nothing.
         throw new InboxHttpError(`message response invalid: ${error instanceof Error ? error.message : error}`, res.status, false);
+      }
+    },
+
+    async reportCall(payload: CallReportPayload) {
+      const res = await call("POST", "/api/bridge/ai-agent/call", payload, DEFAULT_TIMEOUT_MS);
+      if (!res.ok) throw new InboxHttpError(`call returned ${res.status}`, res.status, retryableStatus(res.status));
+      try {
+        return parseMessageResponse(res.json);
+      } catch (error) {
+        throw new InboxHttpError(`call response invalid: ${error instanceof Error ? error.message : error}`, res.status, false);
       }
     },
 

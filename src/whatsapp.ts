@@ -14,6 +14,7 @@ import fs from "fs";
 import path from "path";
 import { Boom } from "@hapi/boom";
 import { config } from "./config.js";
+import type { CallEventLike } from "./agent/calls.js";
 import { saveMessage, upsertSessionStatus } from "./supabase.js";
 import { contactFromChatId, digitsOnly, getMessageType, getTextMessage, rowContactNumber } from "./messageFields.js";
 
@@ -66,6 +67,8 @@ export type SendOrigin = "api" | "scheduled" | "agent";
 // Unset unless AGENT_ENABLED, so existing behavior is unchanged by default.
 export type MessageHooks = {
   onLiveMessage(businessSlug: string, msg: proto.IWebMessageInfo, origin: SendOrigin | "phone" | null): Promise<string | void>;
+  // Live WhatsApp call events (Baileys "call"); `selfIds` are this account's own JIDs, to tell an outgoing call from an incoming one.
+  onCallEvents?(businessSlug: string, events: CallEventLike[], selfIds: Array<string | undefined>): void;
 };
 let messageHooks: MessageHooks | null = null;
 
@@ -411,6 +414,17 @@ export async function startSession(businessSlug: string) {
           startSession(businessSlug).catch(console.error);
         }, 5000);
       }
+    }
+  });
+
+  // Calls are only observed (never answered, rejected or stored here); the agent decides whether a finished call was a missed one.
+  socket.ev.on("call", (events) => {
+    if (!isCurrent() || !messageHooks?.onCallEvents) return;
+    const me = socket.user as { id?: string; lid?: string } | undefined;
+    try {
+      messageHooks.onCallEvents(businessSlug, events as CallEventLike[], [me?.id, me?.lid]);
+    } catch (err) {
+      console.error(`[${businessSlug}] call hook failed:`, err instanceof Error ? err.message : err);
     }
   });
 

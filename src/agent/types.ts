@@ -57,6 +57,28 @@ export type BusinessConfig = {
   // Daily order summary: a separate group that receives the summary (staff_notice) and where "!update" is typed.
   // null / absent (an older Inbox, or no separate group) = the staff group is used and nothing changes.
   ordersGroupJid?: string | null;
+  // Rules & Routing: extra staff groups (complaints / urgent / approvals) that behave like the staff group: their messages are
+  // forwarded and staff_notice / staff_draft / staff_feedback may be sent to them (never relays, never customer kinds).
+  // Absent (an older Inbox) = none.
+  routedGroupJids?: string[];
+  // Missed-call rule: false / absent = calls are not reported and a missed_call_reply is never sent.
+  missedCallsEnabled?: boolean;
+};
+
+export type CallReportPayload = {
+  businessSlug: string;
+  callId: string;
+  callerJid: string;
+  outgoing: boolean;
+  isGroup: boolean;
+  isVideo: boolean | null;
+  offline: boolean;
+  sawOffer: boolean;
+  sawAccept: boolean;
+  sawReject: boolean;
+  finalStatus: "timeout" | "terminate" | "accept" | "reject";
+  offerAt: string | null;
+  endedAt: string | null;
 };
 
 export type ConfigResponse = {
@@ -81,6 +103,8 @@ export interface InboxClient {
   // whether the same whatsappMessageId may be forwarded again.
   forwardMessage(payload: ForwardPayload): Promise<MessageResponse>;
   ack(payload: AckPayload): Promise<AckResult>;
+  // One finished call (see calls.ts). The answer may carry ONE missed_call_reply with send: true. Throws like forwardMessage.
+  reportCall(payload: CallReportPayload): Promise<MessageResponse>;
   // Every returned item was claimed (dispatched) and must be acked.
   claimOutbox(businessSlug: string, limit: number): Promise<OutboxItem[]>;
 }

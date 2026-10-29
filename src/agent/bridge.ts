@@ -6,6 +6,7 @@ import {
   NotSentError,
   type AgentConfig,
   type BusinessConfig,
+  type CallReportPayload,
   type ConfigResponse,
   type InboxClient,
   type OutboxItem,
@@ -152,7 +153,8 @@ export class AgentBridge {
     if (classified.kind === "group") {
       const inStaffGroup = Boolean(business.staffGroupJid) && payload.chatId === business.staffGroupJid;
       const inOrdersGroup = Boolean(business.ordersGroupJid) && payload.chatId === business.ordersGroupJid;
-      if (!inStaffGroup && !inOrdersGroup) return "not_staff_group";
+      const inRoutedGroup = (business.routedGroupJids ?? []).includes(payload.chatId);
+      if (!inStaffGroup && !inOrdersGroup && !inRoutedGroup) return "not_staff_group";
       role = "staff_group";
     } else if (payload.fromMe) {
       role = "human"; // business phone or the inbox's /api/send
@@ -174,6 +176,30 @@ export class AgentBridge {
     this.state.forwards.push({ key, role, payload, receivedAt: at, attempts: 0, nextAttemptAt: at });
     this.journal.save();
     return "queued";
+  }
+
+  // ── Calls ──────────────────────────────────────────────────────────────
+
+  // One finished call (calls.ts). Reported only while the Inbox's last config says the missed-call rule is on; the Inbox decides
+  // everything and answers with at most one missed_call_reply, which goes through the same guarded send as every other item.
+  // A failed report is not retried: a missed call is only answered while it is fresh.
+  async onCallReport(businessSlug: string, report: Omit<CallReportPayload, "businessSlug">): Promise<string> {
+    if (!this.config.enabled) return "agent_disabled";
+    const business = await this.businessConfig(businessSlug);
+    if (!business?.forwardMessages) return "not_forwarding";
+    if (business.missedCallsEnabled !== true) return "missed_calls_disabled";
+    let response;
+    try {
+      response = await this.inbox.reportCall({ ...report, businessSlug });
+    } catch (error) {
+      this.log(`call report ${report.callId} failed: ${errorText(error)}`);
+      return "report_failed";
+    }
+    const fresh = response.outbox.filter((item) => item.send && item.kind === "missed_call_reply" && !this.state.outbox[item.id]).map((item) => this.record(item, "message", null));
+    this.journal.save();
+    this.log(`call ${report.callId} (${report.finalStatus}): ${response.status} items=${fresh.length}`);
+    for (const item of fresh) await this.deliver(item);
+    return fresh.length > 0 ? "replied" : "reported";
   }
 
   // ── Worker ─────────────────────────────────────────────────────────────
@@ -317,7 +343,7 @@ export class AgentBridge {
       // Observe is polled only for staff-group items (batched escalation
       // notices); the Inbox hands out just what the current mode permits.
       if (!business.forwardMessages) continue;
-      const observeStaffOnly = business.mode === "observe" && business.staffNoticesEnabled && Boolean(business.staffGroupJid || business.ordersGroupJid);
+      const observeStaffOnly = business.mode === "observe" && business.staffNoticesEnabled && Boolean(business.staffGroupJid || business.ordersGroupJid || business.routedGroupJids?.length);
       // Approval Pilot is polled for approved sends and staff-group posts; the Inbox hands out only what its mode permits.
       if (business.mode !== "assisted" && business.mode !== "approval_pilot" && !observeStaffOnly) continue;
       if (!this.sender.isConnected(business.businessSlug)) continue;
@@ -358,25 +384,36 @@ export class AgentBridge {
     const pilot = business.mode === "approval_pilot";
     if (pilot) {
       // Approval Pilot: only PILOT_KINDS, and a staff_relay only to a customer — never into the staff group.
-      if (!PILOT_KINDS.has(entry.kind)) return "approval_pilot_mode";
+      // (A missed_call_reply is the admin's own fixed text for a caller, switched on explicitly in the Inbox; checked below.)
+      if (!PILOT_KINDS.has(entry.kind) && entry.kind !== "missed_call_reply") return "approval_pilot_mode";
       if (entry.kind === "staff_relay" && entry.to.endsWith("@g.us")) return "approval_pilot_mode";
     } else if (business.mode !== "assisted") {
       if (!observing || !OBSERVE_KINDS.has(entry.kind)) return "observe_mode";
       if (!business.staffNoticesEnabled) return "staff_notices_disabled";
     }
     if (!this.sender.isConnected(entry.businessSlug)) return "session_disconnected";
+    // The missed-call reply needs the rule to be on in the Inbox's last config, whatever `send` says.
+    if (entry.kind === "missed_call_reply" && business.missedCallsEnabled !== true) return "missed_calls_disabled";
     const body = entry.body ?? "";
     if (!body.trim() || body.length > MAX_BODY_LENGTH) return "invalid_body";
     // Staff-group kinds never reach a customer chat, in any mode.
     if ((observing || STAFF_GROUP_KINDS.has(entry.kind)) && !entry.to.endsWith("@g.us")) return "not_staff_group";
 
+    // A missed-call reply is for the person who called: never into a group, in any mode.
+    if (entry.kind === "missed_call_reply" && !DIRECT_JID.test(entry.to)) return "invalid_recipient";
     if (entry.to.endsWith("@g.us")) {
-      if (entry.to !== business.staffGroupJid && entry.to !== business.ordersGroupJid) business = await this.businessConfig(entry.businessSlug, true);
+      const isRouted = (b: BusinessConfig) => (b.routedGroupJids ?? []).includes(entry.to);
+      if (entry.to !== business.staffGroupJid && entry.to !== business.ordersGroupJid && !isRouted(business)) business = await this.businessConfig(entry.businessSlug, true);
       if (!business) return "not_staff_group";
       if (entry.to !== business.staffGroupJid) {
-        // The separate Orders group takes the order summary and refusals to "!update" only: never drafts or relays.
-        const ordersKinds = observing ? ORDERS_GROUP_OBSERVE_KINDS : ORDERS_GROUP_KINDS;
-        if (!business.ordersGroupJid || entry.to !== business.ordersGroupJid || !ordersKinds.has(entry.kind)) return "not_staff_group";
+        if (isRouted(business)) {
+          // A Rules & Routing group is a staff group: the staff-group kinds only, never a relay or a customer kind.
+          if (!STAFF_GROUP_KINDS.has(entry.kind)) return "not_staff_group";
+        } else {
+          // The separate Orders group takes the order summary and refusals to "!update" only: never drafts or relays.
+          const ordersKinds = observing ? ORDERS_GROUP_OBSERVE_KINDS : ORDERS_GROUP_KINDS;
+          if (!business.ordersGroupJid || entry.to !== business.ordersGroupJid || !ordersKinds.has(entry.kind)) return "not_staff_group";
+        }
       }
       if (observing || pilot) {
         // Flood guard for Observe / Approval Pilot staff-group posts (not counted as AI replies below).
